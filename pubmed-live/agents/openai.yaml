@@ -1,0 +1,4 @@
+interface:
+  display_name: "PubMed 实时检索"
+  short_description: "实时检索 PubMed 文献与摘要,用于写作时补充参考文献"
+  default_prompt: "帮我检索 PubMed 中关于 <主题> 的文献,并给出摘要"

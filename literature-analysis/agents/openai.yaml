@@ -1,0 +1,4 @@
+interface:
+  display_name: "文献分析与筛选"
+  short_description: "按自定义字段精确提取 PubMed 摘要信息,并按纳入/排除标准筛选文献"
+  default_prompt: "分析这些 PubMed 文献,提取研究设计、样本量、模态、验证方式、主要结果;再筛选出有外部验证的文献"
