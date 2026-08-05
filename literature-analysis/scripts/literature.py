@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -610,6 +611,52 @@ EXTRACT_FIELDS = [
 STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "to", "by", "from",
              "vs", "versus", "using", "based", "its", "their", "this", "that", "we", "our",
              "study", "studies", "patients", "cancer", "with", "new", "novel", "analysis"}
+
+BROWSER_ENGINES = ["bing", "google-scholar", "cnki", "wanfang", "vip"]
+
+
+def cmd_browser_search(args):
+    """Unified browser-assisted search for platforms without public APIs."""
+    mjs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_search.mjs")
+    node = shutil.which("node") or r"D:\Program Files\nodejs\node.exe"
+    if not os.path.isfile(node):
+        sys.exit("Node.js not found; browser search requires Node 22+.")
+    if args.print_url:
+        proc = subprocess.run(
+            [node, mjs, "--engine", args.engine, "--query", args.query, "--print-url", "1"],
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        print(proc.stdout.strip() or proc.stderr.strip())
+        return
+    cmd = [node, mjs, "--engine", args.engine, "--query", args.query, "--max", str(args.max), "--port", str(args.port)]
+    if args.url:
+        cmd += ["--url", args.url]
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    if proc.returncode != 0:
+        sys.exit("browser-search failed: " + (proc.stderr.strip() or proc.stdout.strip()))
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        sys.exit("browser-search returned invalid JSON: " + proc.stdout[:500])
+    if data.get("error"):
+        print("browser-search:", data["error"])
+        print("Fallback: open the URL manually (or in the in-app browser), then save records per references/browser-patterns.md and re-run extract.")
+        return
+    records = []
+    for it in data.get("results", []):
+        records.append({
+            "id": it.get("url") or it.get("title") or "",
+            "source_platform": args.engine,
+            "title": it.get("title", ""),
+            "url": it.get("url", ""),
+            "snippet": it.get("snippet", "") or it.get("meta", ""),
+            "journal": "", "pubDate": "", "authors": [], "doi": "", "abstract": "",
+            "pmid": "", "query": args.query,
+        })
+    save_records(records, args.out)
+    print(f"browser-search [{args.engine}]: {data.get('count', 0)} results -> {args.out}")
+    if data.get("needsLogin"):
+        print("Note: this platform usually requires login; finish login in the opened Chrome window and re-run.")
 
 
 def topic_score(topic, text):
@@ -1276,6 +1323,16 @@ def main():
     p_extract.add_argument("--include", help="pipe-separated required keywords, e.g. 'external validation|prospective'")
     p_extract.add_argument("--exclude", help="pipe-separated exclusion keywords, e.g. 'review|animal|editorial'")
     p_extract.set_defaults(func=cmd_extract)
+
+    p_bs = sub.add_parser("browser-search", help="Unified browser search for platforms without APIs (Google Scholar, CNKI, Wanfang, VIP, Bing)")
+    p_bs.add_argument("--engine", choices=BROWSER_ENGINES, default="bing")
+    p_bs.add_argument("--query", required=True)
+    p_bs.add_argument("--max", type=int, default=20)
+    p_bs.add_argument("--port", type=int, default=0, help="Chrome CDP port (default: auto-detect 9222 / DevToolsActivePort)")
+    p_bs.add_argument("--url", help="override the search URL")
+    p_bs.add_argument("--print-url", action="store_true", help="only print the search URL and exit")
+    p_bs.add_argument("--out", default="browser_results.json")
+    p_bs.set_defaults(func=cmd_browser_search)
 
     p_screen = sub.add_parser("screen", help="Deterministic keyword triage (first pass only)")
     p_screen.add_argument("--in", dest="input", required=True)

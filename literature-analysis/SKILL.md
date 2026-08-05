@@ -73,6 +73,26 @@ Google Scholar, CNKI (知网), Wanfang (万方), VIP/中华医学期刊, CiNii/N
 - For language coverage in bulk, rely on OpenAlex/Crossref/DOAJ, which index many Chinese, Japanese, German, French, and Russian journals with original-language titles and abstracts.
 - If the user explicitly asks for one of these platforms, say which ones are browser-only and route through the browser instead of claiming API results.
 
+### Unified browser-search command
+
+One command searches those browser-only platforms and converts results into the standard pipeline:
+
+```powershell
+# Bing (no login, generic fallback)
+python scripts/literature.py browser-search --engine bing --query "radiomics lung cancer" --max 20 --out browser.json
+
+# Google Scholar (may hit CAPTCHA)
+python scripts/literature.py browser-search --engine google-scholar --query "radiomics lung cancer prognosis" --max 20 --out gs.json
+
+# CNKI / Wanfang / VIP (need login once in the CDP Chrome window)
+python scripts/literature.py browser-search --engine cnki --query "肺结节 AI 诊断" --max 20 --out cnki.json
+
+# Print the URL without driving the browser
+python scripts/literature.py browser-search --engine cnki --query "肺结节" --print-url
+```
+
+Requirements: Chrome started with `--remote-debugging-port=9222 --user-data-dir="D:\chrome-cdp"` (see `references/browser-patterns.md`), Node.js 22+. If CDP is unavailable or a site blocks automation, use the in-app browser fallback documented in `references/browser-patterns.md`; results saved as standard JSON still merge into `extract` / `overview`.
+
 ### Directed search - a specific author or institution
 
 Find everything by a specific author, optionally restricted to an institution:
