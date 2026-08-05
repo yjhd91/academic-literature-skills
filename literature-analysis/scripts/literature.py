@@ -732,8 +732,10 @@ STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "to
              "vs", "versus", "using", "based", "its", "their", "this", "that", "we", "our",
              "study", "studies", "patients", "cancer", "with", "new", "novel", "analysis"}
 
-BROWSER_ENGINES = ["bing", "duckduckgo", "google-scholar", "cnki", "wanfang", "vip", "pubmed-web", "ciinii", "base", "cyberleninka"]
-ENGINE_LANGS = {"cnki": "zh-CN", "wanfang": "zh-CN", "vip": "zh-CN", "ciinii": "ja", "base": "de", "cyberleninka": "ru"}
+BROWSER_ENGINES = ["bing", "duckduckgo", "google-scholar", "cnki", "wanfang", "vip", "medjournals",
+                   "pubmed-web", "ciinii", "ndl", "base", "cyberleninka", "elibrary"]
+ENGINE_LANGS = {"cnki": "zh-CN", "wanfang": "zh-CN", "vip": "zh-CN", "medjournals": "zh-CN",
+                "ciinii": "ja", "ndl": "ja", "base": "de", "cyberleninka": "ru", "elibrary": "ru"}
 
 
 def translate_text(text, target_lang="zh-CN"):
@@ -796,16 +798,17 @@ def cmd_browser_search(args):
     for it in data.get("results", []):
         author_raw = it.get("authors") or ""
         authors = [x.strip() for x in str(author_raw).split(";") if x.strip()] if isinstance(author_raw, str) else (author_raw or [])
+        snippet = it.get("snippet") or it.get("meta") or it.get("abstract") or ""
         records.append({
             "id": it.get("url") or it.get("title") or "",
             "source_platform": args.engine,
             "title": it.get("title", ""),
             "url": it.get("url", ""),
-            "snippet": it.get("snippet", "") or it.get("meta", ""),
+            "snippet": snippet,
             "journal": it.get("journal", ""),
             "pubDate": it.get("pubDate", ""),
             "authors": authors,
-            "doi": "", "abstract": "",
+            "doi": it.get("doi", ""), "abstract": it.get("abstract", ""),
             "pmid": "", "query": args.query,
         })
     save_records(records, args.out)

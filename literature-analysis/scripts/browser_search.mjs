@@ -6,7 +6,8 @@
 //   node browser_search.mjs --engine bing --query "radiomics lung cancer" [--max 20] [--port 9222]
 //   node browser_search.mjs --engine cnki --query "肺结节" --print-url 1
 //
-// Engines: bing, google-scholar, cnki, wanfang, vip
+// Engines: bing, duckduckgo, google-scholar, pubmed-web, cnki, wanfang, vip,
+//          medjournals (yiigle), ciinii, ndl, base, cyberleninka, elibrary
 // Requires: Chrome started with --remote-debugging-port (see references/browser-patterns.md).
 
 import { readFileSync } from "node:fs";
@@ -148,22 +149,127 @@ const ENGINES = {
   },
   "wanfang": {
     url: (q) => "https://s.wanfangdata.com.cn/paper?q=" + encodeURIComponent(q),
-    extract: `Array.from(document.querySelectorAll('.title, .result-item')).slice(0, ${max}).map(r => {
-      const a = r.querySelector('a');
-      return { title: r.innerText.trim().split('\\n')[0], url: a ? a.href : '', snippet: '' };
+    extract: `Array.from(document.querySelectorAll('div.normal-list')).slice(0, ${max}).map(r => {
+      const t = r.querySelector('.title-area .title');
+      const idEl = r.querySelector('.title-id-hidden');
+      const abs = r.querySelector('.abstract-area');
+      const authEls = Array.from(r.querySelectorAll('.author-area .authors')).map(a => a.innerText.trim()).filter(Boolean);
+      const j = r.querySelector('.periodical-title');
+      const id = idEl ? idEl.innerText.trim().replace(/^periodical_/, '') : '';
+      return {
+        title: t ? t.innerText.trim().replace(/^\\d+\\.\\s*/, '') : '',
+        url: id ? 'https://d.wanfangdata.com.cn/periodical/' + id : '',
+        authors: authEls.length > 1 ? authEls.slice(0, -1).join('; ') : '',
+        journal: j ? j.innerText.trim() : '',
+        pubDate: authEls.length ? authEls[authEls.length - 1] : '',
+        snippet: abs ? abs.innerText.trim().replace(/^摘要：/, '') : '',
+      };
     }).filter(x => x.title)`,
-    waitMs: 6000,
-    probe: ".title, .result-item",
+    waitMs: 10000,
+    probe: () => `document.querySelectorAll('div.normal-list').length > 0 || document.body.innerText.includes('找到')`,
+    totalExpr: () => `(() => { const m = document.body.innerText.match(/找到([\\d,]+)条文献/); return m ? m[1] : ''; })()`,
+    nextPage: `(() => {
+      const b = Array.from(document.querySelectorAll('span.ctrl-btn, a.ctrl-btn, .ctrl-btn')).find(x => (x.innerText || '').trim() === '>');
+      if (b) { b.click(); return true; }
+      return false;
+    })()`,
     needsLogin: true,
   },
   "vip": {
     url: (q) => "https://qikan.cqvip.com/Qikan/Search/Index?key=" + encodeURIComponent(q),
-    extract: `Array.from(document.querySelectorAll('.result-list li, .list-item')).slice(0, ${max}).map(r => {
-      const a = r.querySelector('a');
-      return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', snippet: '' };
+    extract: `Array.from(document.querySelectorAll('.result-list li, .list-item, .result-item')).slice(0, ${max}).map(r => {
+      const a = r.querySelector('a.title, h3 a, a');
+      const abs = r.querySelector('.abstract, .summary');
+      return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', snippet: abs ? abs.innerText.trim() : '' };
     }).filter(x => x.title)`,
     waitMs: 6000,
-    probe: ".result-list li, .list-item",
+    probe: ".result-list li, .list-item, .result-item",
+    needsLogin: true,
+  },
+  "medjournals": {
+    // 中华医学期刊全文数据库 (medjournals.cn -> www.yiigle.com/Paper/Search)
+    // Public-facing Vue app; results come from POST /apiVue/search/searchList.
+    // We call the API from the page context so cookies/localStorage token apply.
+    url: (q) => "https://www.yiigle.com/Paper/Search?searchType=pt&q=" + encodeURIComponent(q),
+    extractAsync: `(async () => {
+      const token = localStorage.getItem('_login-token') || '';
+      const q = ${JSON.stringify("__QUERY__")};
+      const limit = ${max};
+      const pageSize = 50;
+      const out = [];
+      let total = '';
+      for (let page = 1; out.length < limit && page <= 200; page++) {
+        const r = await fetch('/apiVue/search/searchList', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sortField: '', page, searchType: 'pt', pageSize,
+            queryString: q, query: '', searchText: q, searchLog: q,
+            isAggregations: 'N', logintoken: token
+          })
+        });
+        if (!r.ok) break;
+        const j = await r.json();
+        const res = j && j.data && j.data.result;
+        if (!res) break;
+        if (page === 1) total = String(res.searchTotal || '');
+        const items = (res.infos || []);
+        for (const x of items) {
+          const authors = (x.authorNames || []).join('; ');
+          const date = x.artPubYear ? String(x.artPubYear) : (x.artPubDate || '').slice(0, 10);
+          out.push({
+            title: x.artTitle || '',
+            url: x.artUrl || '',
+            doi: x.artDoi || '',
+            authors,
+            journal: x.journalCn || '',
+            pubDate: date,
+            meta: [x.docType, x.journalCn, x.vol ? x.vol + '卷' : '', x.issue ? x.issue + '期' : '', x.startPage ? x.startPage + '-' + (x.endPage || '') : ''].filter(Boolean).join(' '),
+            snippet: x.artAbstract || '',
+            total
+          });
+          if (out.length >= limit) break;
+        }
+        if (items.length < pageSize) break;
+      }
+      if (out.length && out[0].total) total = out[0].total;
+      return { items: out, total };
+    })()`,
+    waitMs: 12000,
+    probe: () => `document.body.innerText.includes('找到') || location.href.includes('yiigle.com/Paper/Search')`,
+    needsLogin: false,
+  },
+  "ndl": {
+    // NDL Search (国立国会図書館サーチ). Best effort: some networks/IPs get 503.
+    // Results are rendered client-side; record links look like /books/R100000002-*.
+    url: (q) => "https://ndlsearch.ndl.go.jp/search?cs=bib&q=" + encodeURIComponent(q),
+    extract: `(() => {
+      const seen = new Set();
+      return Array.from(document.querySelectorAll('a[href*="/books/"], a[href*="/R/"], [class*="record"] a, [class*="result"] a')).slice(0, ${max * 4}).map(a => {
+        const block = a.closest('li, article, div');
+        return { title: a.innerText.trim(), url: a.href, snippet: block ? block.innerText.slice(0, 220) : '' };
+      }).filter(x => x.title && x.title.length > 5 && !seen.has(x.url) && seen.add(x.url)).slice(0, ${max});
+    })()`,
+    waitMs: 12000,
+    probe: () => `document.querySelectorAll('a[href*="/books/"], a[href*="/R/"]').length > 0`,
+    needsLogin: false,
+  },
+  "elibrary": {
+    // eLIBRARY.RU (俄罗斯). 强制登录会话:未登录会被重定向到 start_session.asp。
+    // 登录一次后(在可见 CDP Chrome 窗口),结果页 query_results.asp 的表格可被解析。
+    url: (q) => "https://elibrary.ru/query_results.asp?query=" + encodeURIComponent(q) + "&where_name=1&where_abstract=1&type_article=1",
+    extract: `(() => {
+      const seen = new Set();
+      const rows = Array.from(document.querySelectorAll('tr')).map(tr => {
+        const a = tr.querySelector('a[href*="item.asp?id="]');
+        if (!a) return null;
+        const cells = Array.from(tr.querySelectorAll('td')).map(c => c.innerText.trim());
+        return { title: a.innerText.trim(), url: 'https://elibrary.ru/' + a.getAttribute('href'), snippet: cells.join(' | ').slice(0, 260) };
+      }).filter(Boolean);
+      return rows.filter(x => x.title && !seen.has(x.url) && seen.add(x.url)).slice(0, ${max});
+    })()`,
+    waitMs: 12000,
+    probe: () => `document.querySelectorAll('a[href*="item.asp?id="]').length > 0 || document.body.innerText.includes('Вход в библиотеку') || document.body.innerText.includes('Результаты')`,
     needsLogin: true,
   },
 };
@@ -271,8 +377,18 @@ async function run() {
     });
     console.error("[debug] " + (dbg.result && dbg.result.result && dbg.result.result.value));
   }
-  const evalRes = await send("Runtime.evaluate", { expression: cfg.extract, returnByValue: true });
-  const items = (evalRes.result && evalRes.result.result && evalRes.result.result.value) || [];
+  let items = [];
+  let total = "";
+  if (cfg.extractAsync) {
+    const expr = cfg.extractAsync.replace("__QUERY__", query.replace(/\\/g, "\\\\").replace(/"/g, '\\"'));
+    const evalRes = await send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true });
+    const val = (evalRes.result && evalRes.result.result && evalRes.result.result.value) || null;
+    if (val && Array.isArray(val.items)) items = val.items;
+    if (val && val.total) total = val.total;
+  } else {
+    const evalRes = await send("Runtime.evaluate", { expression: cfg.extract, returnByValue: true });
+    items = (evalRes.result && evalRes.result.result && evalRes.result.result.value) || [];
+  }
   let all = items.slice();
   if (cfg.nextPage) {
     let guard = 0;
@@ -281,7 +397,7 @@ async function run() {
       const nx = await send("Runtime.evaluate", { expression: cfg.nextPage, returnByValue: true });
       const clicked = nx.result && nx.result.result && nx.result.result.value;
       if (!clicked) break;
-      await new Promise((r) => setTimeout(r, 2500));
+      await new Promise((r) => setTimeout(r, 4200));
       const more = await send("Runtime.evaluate", { expression: cfg.extract, returnByValue: true });
       const moreItems = (more.result && more.result.result && more.result.result.value) || [];
       let added = 0;
@@ -297,8 +413,7 @@ async function run() {
     }
   }
   const results = all.slice(0, max);
-  let total = "";
-  if (cfg.totalExpr) {
+  if (!total && cfg.totalExpr) {
     const t = await send("Runtime.evaluate", { expression: cfg.totalExpr(), returnByValue: true });
     total = (t.result && t.result.result && t.result.result.value) || "";
   }

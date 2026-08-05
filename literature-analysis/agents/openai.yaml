@@ -1,4 +1,4 @@
 interface:
-  display_name: "文献分析与筛选"
-  short_description: "按自定义字段精确提取 PubMed 摘要信息,并按纳入/排除标准筛选文献"
-  default_prompt: "分析这些 PubMed 文献,提取研究设计、样本量、模态、验证方式、主要结果;再筛选出有外部验证的文献"
+  display_name: "文献检索分析工作台"
+  short_description: "多源多语言文献检索、自动策略生成、浏览器翻页抓取、摘要精确提取与筛选，输出 xlsx/表格"
+  default_prompt: "帮我检索并分析这个话题的文献：生成多数据库检索策略，API 库自动检索，浏览器抓取知网/万方/中华医学期刊等，汇总成 xlsx 并精确提取研究设计、样本量、验证、性能等字段，最后筛选出我需要的文献"
