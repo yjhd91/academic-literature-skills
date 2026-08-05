@@ -15,6 +15,9 @@ Drives a real Chrome (via DevTools Protocol) to search platforms that have no pu
 | `wanfang` | `https://s.wanfangdata.com.cn/paper?q=<q>` | `.title`, `.result-item` | yes | May require captcha/login |
 | `vip` | `https://qikan.cqvip.com/Qikan/Search/Index?key=<q>` | `.result-list li` | yes | 维普/中华医学期刊 |
 | `pubmed-web` | `https://pubmed.ncbi.nlm.nih.gov/?term=<q>` | `.docsum-content a.docsum-title`, `.full-journal-citation`, `.docsum-snippet` | no | Real biomedical website; works headless (verified) |
+| `ciinii` | `https://cir.nii.ac.jp/all?q=<q>` | `a[href*="/crid/"]` + name/short-title filter | no | Japanese CiNii Research; verified (10 real papers, English keywords) |
+| `base` | `https://www.base-search.net/Search/Results?lookfor=<q>` | `div.result` | no | German BASE; **403-blocked from this network** - rely on OpenAlex/DOAJ for German coverage |
+| `cyberleninka` | `https://cyberleninka.ru/search?q=<q>` | `a[href*="/article/n/"]` | no | Russian OA library; verified (10 real Russian papers) |
 
 Selectors change when sites update. If extraction returns 0 results but the page opened, inspect the page manually (in-app browser or Chrome) and update the selectors in `scripts/browser_search.mjs`.
 
@@ -31,6 +34,8 @@ Verified end-to-end (CNKI, 2026-08): after the user completes the slider verific
 | (future) HAL / French | fr | ... |
 
 Verified translations (medical term): zh-CN `放射组学肺癌预后`, ja `ラジオミクスによる肺がんの予後`, de `Radiomics-Lungenkrebsprognose`, fr `pronostic du cancer du poumon radiomique`, ru `радиомиктический прогноз рака легких`.
+
+Multilingual live tests (2026-08): CiNii (Japanese) and CyberLeninka (Russian) both return real results via the visible CDP Chrome; BASE returns HTTP 403 from this network. Sentence-form auto-translations work best on free-text engines (CiNii/CyberLeninka); for field-syntax engines prefer keyword-style queries. CiNii mixes author profile links into results - the extractor filters them by strict all-capitalized name patterns and URL/title dedupe.
 
 ## Headless Chrome and anti-bot reality
 

@@ -59,6 +59,48 @@ const ENGINES = {
     probe: ".docsum-content",
     needsLogin: false,
   },
+  "ciinii": {
+    url: (q) => "https://cir.nii.ac.jp/all?q=" + encodeURIComponent(q),
+    extract: `(() => {
+      const seen = new Set();
+      const seenTitles = new Set();
+      return Array.from(document.querySelectorAll('a[href*="/crid/"], a[href*="/articles/"]')).map(a => {
+        const block = a.closest('div, li');
+        return { title: a.innerText.trim(), url: a.href, snippet: block ? block.innerText.slice(0, 220) : '' };
+      }).filter(x => {
+        const t = (x.title || '').replace(/\u00A0/g, ' ').replace(/[，,]/g, ',').replace(/　/g, ' ').trim();
+        x.title = t;
+        const isName = /^[A-Z][a-z]+,\\s*[A-Z][a-z]+$/.test(t) || /^[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)+$/.test(t);
+        return t.length > 12
+          && !isName
+          && !seen.has(x.url.toLowerCase()) && seen.add(x.url.toLowerCase())
+          && !seenTitles.has(t.toLowerCase()) && seenTitles.add(t.toLowerCase());
+      }).slice(0, ${max});
+    })()`,
+    waitMs: 12000,
+    probe: () => `document.querySelectorAll('a[href*="/crid/"], a[href*="/articles/"]').length > 0`,
+    needsLogin: false,
+  },
+  "base": {
+    url: (q) => "https://www.base-search.net/Search/Results?lookfor=" + encodeURIComponent(q),
+    extract: `Array.from(document.querySelectorAll('.result, .result-item, li.list-item')).slice(0, ${max}).map(r => {
+      const a = r.querySelector('a[href*="base-search"], h2 a, a.result-title');
+      const s = r.querySelector('.result-text, .snippet');
+      return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', snippet: s ? s.innerText.trim() : '' };
+    }).filter(x => x.title)`,
+    waitMs: 10000,
+    probe: ".result, .result-item",
+    needsLogin: false,
+  },
+  "cyberleninka": {
+    url: (q) => "https://cyberleninka.ru/search?q=" + encodeURIComponent(q),
+    extract: `Array.from(document.querySelectorAll('a[href*="/article/n/"]')).slice(0, ${max}).map(a => ({
+      title: a.innerText.trim(), url: a.href, snippet: ''
+    })).filter(x => x.title)`,
+    waitMs: 12000,
+    probe: () => `document.querySelectorAll('a[href*="/article/n/"]').length > 0`,
+    needsLogin: false,
+  },
   "google-scholar": {
     url: (q) => "https://scholar.google.com/scholar?hl=en&q=" + encodeURIComponent(q),
     extract: `Array.from(document.querySelectorAll('.gs_r.gs_or')).slice(0, ${max}).map(r => {
@@ -224,7 +266,7 @@ async function run() {
   }
   if (opt("debug", "") === "1") {
     const dbg = await send("Runtime.evaluate", {
-      expression: `JSON.stringify({ title: document.title, url: location.href, algo: document.querySelectorAll('li.b_algo').length, docsum: document.querySelectorAll('article.docsum, .docsum-title, .docsum-content').length, trs: document.querySelectorAll('table tr').length, rowhtml: (document.querySelector('table tr') ? document.querySelector('table tr').outerHTML.slice(0, 700) : ''), body: (document.body ? document.body.innerText.slice(0, 400) : '') })`,
+      expression: `JSON.stringify({ title: document.title, url: location.href, body: (document.body ? document.body.innerText.slice(0, 900) : '') })`,
       returnByValue: true,
     });
     console.error("[debug] " + (dbg.result && dbg.result.result && dbg.result.result.value));

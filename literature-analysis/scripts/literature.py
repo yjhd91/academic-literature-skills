@@ -732,8 +732,8 @@ STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "to
              "vs", "versus", "using", "based", "its", "their", "this", "that", "we", "our",
              "study", "studies", "patients", "cancer", "with", "new", "novel", "analysis"}
 
-BROWSER_ENGINES = ["bing", "duckduckgo", "google-scholar", "cnki", "wanfang", "vip", "pubmed-web"]
-ENGINE_LANGS = {"cnki": "zh-CN", "wanfang": "zh-CN", "vip": "zh-CN"}
+BROWSER_ENGINES = ["bing", "duckduckgo", "google-scholar", "cnki", "wanfang", "vip", "pubmed-web", "ciinii", "base", "cyberleninka"]
+ENGINE_LANGS = {"cnki": "zh-CN", "wanfang": "zh-CN", "vip": "zh-CN", "ciinii": "ja", "base": "de", "cyberleninka": "ru"}
 
 
 def translate_text(text, target_lang="zh-CN"):
