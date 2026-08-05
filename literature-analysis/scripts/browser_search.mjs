@@ -33,6 +33,30 @@ const ENGINES = {
       return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', snippet: p ? p.innerText.trim() : '' };
     }).filter(x => x.title)`,
     waitMs: 3500,
+    probe: "li.b_algo",
+    needsLogin: false,
+  },
+  "duckduckgo": {
+    url: (q) => "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(q),
+    extract: `Array.from(document.querySelectorAll('div.result')).slice(0, ${max}).map(r => {
+      const a = r.querySelector('a.result__a');
+      const s = r.querySelector('a.result__snippet');
+      return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', snippet: s ? s.innerText.trim() : '' };
+    }).filter(x => x.title)`,
+    waitMs: 4000,
+    probe: "div.result",
+    needsLogin: false,
+  },
+  "pubmed-web": {
+    url: (q) => "https://pubmed.ncbi.nlm.nih.gov/?term=" + encodeURIComponent(q),
+    extract: `Array.from(document.querySelectorAll('.docsum-content')).slice(0, ${max}).map(r => {
+      const a = r.querySelector('a.docsum-title');
+      const m = r.querySelector('.full-journal-citation');
+      const s = r.querySelector('.docsum-snippet');
+      return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', meta: m ? m.innerText.trim() : '', snippet: s ? s.innerText.trim() : '' };
+    }).filter(x => x.title)`,
+    waitMs: 10000,
+    probe: ".docsum-content",
     needsLogin: false,
   },
   "google-scholar": {
@@ -44,6 +68,7 @@ const ENGINES = {
       return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', meta: m ? m.innerText.trim() : '', snippet: s ? s.innerText.trim() : '' };
     }).filter(x => x.title)`,
     waitMs: 4500,
+    probe: ".gs_r",
     needsLogin: false,
   },
   "cnki": {
@@ -53,6 +78,7 @@ const ENGINES = {
       return { title: a ? a.innerText.trim() : r.innerText.trim().split('\\n')[0], url: a ? a.href : '', snippet: '' };
     }).filter(x => x.title)`,
     waitMs: 6000,
+    probe: ".result-table-list tbody tr, .list-item",
     needsLogin: true,
   },
   "wanfang": {
@@ -62,6 +88,7 @@ const ENGINES = {
       return { title: r.innerText.trim().split('\\n')[0], url: a ? a.href : '', snippet: '' };
     }).filter(x => x.title)`,
     waitMs: 6000,
+    probe: ".title, .result-item",
     needsLogin: true,
   },
   "vip": {
@@ -71,6 +98,7 @@ const ENGINES = {
       return { title: a ? a.innerText.trim() : '', url: a ? a.href : '', snippet: '' };
     }).filter(x => x.title)`,
     waitMs: 6000,
+    probe: ".result-list li, .list-item",
     needsLogin: true,
   },
 };
@@ -97,14 +125,14 @@ function discoverPorts() {
 }
 
 async function openTarget(port) {
-  const base = `http://127.0.0.1:${port}`;
-  let target;
-  try {
-    target = await fetch(base + "/json/new?about:blank", { method: "PUT" }).then((r) => r.json());
-  } catch {
-    target = await fetch(base + "/json/new?about:blank").then((r) => r.json());
+  for (const host of ["127.0.0.1", "localhost", "[::1]"]) {
+    const base = `http://${host}:${port}`;
+    try {
+      const target = await fetch(base + "/json/new?about:blank", { method: "PUT" }).then((r) => r.json());
+      if (target.webSocketDebuggerUrl) return target.webSocketDebuggerUrl;
+    } catch { /* try next host */ }
   }
-  return target.webSocketDebuggerUrl;
+  throw new Error("no CDP target");
 }
 
 async function run() {
@@ -154,7 +182,25 @@ async function run() {
   await send("Page.enable");
   await send("Runtime.enable");
   await send("Page.navigate", { url: targetUrl });
-  await new Promise((r) => setTimeout(r, cfg.waitMs));
+  const start = Date.now();
+  while (Date.now() - start < cfg.waitMs) {
+    const probeRes = await send("Runtime.evaluate", {
+      expression: `document.querySelectorAll('${cfg.probe}').length > 0`,
+      returnByValue: true,
+    });
+    if (probeRes.result && probeRes.result.result && probeRes.result.result.value === true) {
+      await new Promise((r) => setTimeout(r, 800));
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  if (opt("debug", "") === "1") {
+    const dbg = await send("Runtime.evaluate", {
+      expression: `JSON.stringify({ title: document.title, url: location.href, algo: document.querySelectorAll('li.b_algo').length, docsum: document.querySelectorAll('article.docsum, .docsum-title, .docsum-content').length, body: (document.body ? document.body.innerText.slice(0, 600) : '') })`,
+      returnByValue: true,
+    });
+    console.error("[debug] " + (dbg.result && dbg.result.result && dbg.result.result.value));
+  }
   const evalRes = await send("Runtime.evaluate", { expression: cfg.extract, returnByValue: true });
   const items = (evalRes.result && evalRes.result.result && evalRes.result.result.value) || [];
   const results = items.slice(0, max);

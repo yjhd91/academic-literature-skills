@@ -96,6 +96,12 @@ One command searches those browser-only platforms and converts results into the 
 # Bing (no login, generic fallback)
 python scripts/literature.py browser-search --engine bing --query "radiomics lung cancer" --max 20 --out browser.json
 
+# DuckDuckGo HTML (no login; may CAPTCHA headless)
+python scripts/literature.py browser-search --engine duckduckgo --query "radiomics lung cancer" --max 20 --out ddg.json
+
+# PubMed website (real biomedical page; verified headless extraction)
+python scripts/literature.py browser-search --engine pubmed-web --query "radiomics lung cancer prognosis" --max 20 --out pm.json
+
 # Google Scholar (may hit CAPTCHA)
 python scripts/literature.py browser-search --engine google-scholar --query "radiomics lung cancer prognosis" --max 20 --out gs.json
 
@@ -106,7 +112,9 @@ python scripts/literature.py browser-search --engine cnki --query "肺结节 AI 
 python scripts/literature.py browser-search --engine cnki --query "肺结节" --print-url
 ```
 
-Requirements: Chrome started with `--remote-debugging-port=9222 --user-data-dir="D:\chrome-cdp"` (see `references/browser-patterns.md`), Node.js 22+. If CDP is unavailable or a site blocks automation, use the in-app browser fallback documented in `references/browser-patterns.md`; results saved as standard JSON still merge into `extract` / `overview`.
+The query is auto-translated into the engine's language: CNKI/Wanfang/VIP automatically translate to Chinese (`radiomics lung cancer prognosis` -> `放射组学肺癌预后`); standalone translation via `translate-query --text "..." --to ja|de|fr|ru|zh-CN`.
+
+Requirements: Chrome started with `--remote-debugging-port=9222 --user-data-dir="D:\chrome-cdp"` (see `references/browser-patterns.md`), Node.js 22+. Headless Chrome is CAPTCHA-blocked by Bing/DuckDuckGo/Google Scholar - complete the challenge once in the visible CDP Chrome window and re-run, or use the in-app browser fallback documented in `references/browser-patterns.md`; results saved as standard JSON still merge into `extract` / `overview`.
 
 ### Directed search - a specific author or institution
 

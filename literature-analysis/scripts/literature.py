@@ -732,7 +732,31 @@ STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "to
              "vs", "versus", "using", "based", "its", "their", "this", "that", "we", "our",
              "study", "studies", "patients", "cancer", "with", "new", "novel", "analysis"}
 
-BROWSER_ENGINES = ["bing", "google-scholar", "cnki", "wanfang", "vip"]
+BROWSER_ENGINES = ["bing", "duckduckgo", "google-scholar", "cnki", "wanfang", "vip", "pubmed-web"]
+ENGINE_LANGS = {"cnki": "zh-CN", "wanfang": "zh-CN", "vip": "zh-CN"}
+
+
+def translate_text(text, target_lang="zh-CN"):
+    """Translate via the free Google Translate endpoint (no API key)."""
+    if not text:
+        return text
+    url = ("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" + target_lang
+           + "&dt=t&q=" + urllib.parse.quote(text))
+    try:
+        data = json.loads(http_get_retry(url))
+        parts = []
+        for seg in (data or [])[0]:
+            if seg and seg[0]:
+                parts.append(seg[0])
+        return "".join(parts) if parts else text
+    except Exception:
+        return text
+
+
+def cmd_translate_query(args):
+    """Standalone query translation for language-specific databases."""
+    result = translate_text(args.text, args.to)
+    print(f"{args.text} -> {result}")
 
 
 def cmd_browser_search(args):
@@ -741,14 +765,20 @@ def cmd_browser_search(args):
     node = shutil.which("node") or r"D:\Program Files\nodejs\node.exe"
     if not os.path.isfile(node):
         sys.exit("Node.js not found; browser search requires Node 22+.")
+    query = args.query
+    if not args.no_translate and args.engine in ENGINE_LANGS:
+        translated = translate_text(query, ENGINE_LANGS[args.engine])
+        if translated != query:
+            print(f"[translate] {args.engine} uses {ENGINE_LANGS[args.engine]}: {query} -> {translated}")
+            query = translated
     if args.print_url:
         proc = subprocess.run(
-            [node, mjs, "--engine", args.engine, "--query", args.query, "--print-url", "1"],
+            [node, mjs, "--engine", args.engine, "--query", query, "--print-url", "1"],
             capture_output=True, text=True, encoding="utf-8",
         )
         print(proc.stdout.strip() or proc.stderr.strip())
         return
-    cmd = [node, mjs, "--engine", args.engine, "--query", args.query, "--max", str(args.max), "--port", str(args.port)]
+    cmd = [node, mjs, "--engine", args.engine, "--query", query, "--max", str(args.max), "--port", str(args.port)]
     if args.url:
         cmd += ["--url", args.url]
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
@@ -1475,8 +1505,14 @@ def main():
     p_bs.add_argument("--port", type=int, default=0, help="Chrome CDP port (default: auto-detect 9222 / DevToolsActivePort)")
     p_bs.add_argument("--url", help="override the search URL")
     p_bs.add_argument("--print-url", action="store_true", help="only print the search URL and exit")
+    p_bs.add_argument("--no-translate", action="store_true", help="disable auto-translation of the query to the engine's language")
     p_bs.add_argument("--out", default="browser_results.json")
     p_bs.set_defaults(func=cmd_browser_search)
+
+    p_tq = sub.add_parser("translate-query", help="Translate a query for language-specific databases")
+    p_tq.add_argument("--text", required=True)
+    p_tq.add_argument("--to", default="zh-CN", help="target language code (zh-CN, ja, de, fr, ru, en)")
+    p_tq.set_defaults(func=cmd_translate_query)
 
     p_screen = sub.add_parser("screen", help="Deterministic keyword triage (first pass only)")
     p_screen.add_argument("--in", dest="input", required=True)

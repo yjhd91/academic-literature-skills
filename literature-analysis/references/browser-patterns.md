@@ -9,12 +9,34 @@ Drives a real Chrome (via DevTools Protocol) to search platforms that have no pu
 | Engine | Search URL template | Extractors (CSS) | Login | Notes |
 |--------|--------------------|------------------|-------|-------|
 | `bing` | `https://www.bing.com/search?q=<q>` | `li.b_algo h2 a`, `.b_caption p` | no | Generic fallback; no login needed |
+| `duckduckgo` | `https://html.duckduckgo.com/html/?q=<q>` | `div.result a.result__a`, `a.result__snippet` | no | HTML endpoint; still may CAPTCHA headless |
 | `google-scholar` | `https://scholar.google.com/scholar?hl=en&q=<q>` | `.gs_r .gs_ri h3 a`, `.gs_a`, `.gs_rs` | no | Anti-bot may show CAPTCHA; retry or switch to in-app browser |
 | `cnki` | `https://kns.cnki.net/kns8s/defaultresult/index?kw=<q>` | `.result-table-list tbody tr`, `.list-item` | yes (institutional) | Login once in the CDP Chrome; keep session |
 | `wanfang` | `https://s.wanfangdata.com.cn/paper?q=<q>` | `.title`, `.result-item` | yes | May require captcha/login |
 | `vip` | `https://qikan.cqvip.com/Qikan/Search/Index?key=<q>` | `.result-list li` | yes | 维普/中华医学期刊 |
+| `pubmed-web` | `https://pubmed.ncbi.nlm.nih.gov/?term=<q>` | `.docsum-content a.docsum-title`, `.full-journal-citation`, `.docsum-snippet` | no | Real biomedical website; works headless (verified) |
 
 Selectors change when sites update. If extraction returns 0 results but the page opened, inspect the page manually (in-app browser or Chrome) and update the selectors in `scripts/browser_search.mjs`.
+
+## Query translation by target language
+
+`browser-search` auto-translates the query into the engine's language before searching (via the free Google Translate endpoint; `--no-translate` disables it). `translate-query --text "..." --to ja` does standalone translation.
+
+| Engine | Target language | Example |
+|--------|----------------|---------|
+| `cnki`, `wanfang`, `vip` | zh-CN | `radiomics lung cancer prognosis` -> `放射组学肺癌预后` |
+| (future) `ciinii` | ja | `radiomics` -> `ラジオミクス` |
+| (future) HAL / French | fr | ... |
+
+Verified translations (medical term): zh-CN `放射组学肺癌预后`, ja `ラジオミクスによる肺がんの予後`, de `Radiomics-Lungenkrebsprognose`, fr `pronostic du cancer du poumon radiomique`, ru `радиомиктический прогноз рака легких`.
+
+## Headless Chrome and anti-bot reality
+
+Headless Chrome from this network is CAPTCHA-blocked by Bing, DuckDuckGo, Google Scholar, and Mojeek (`Please solve the following puzzle` / `Select all squares containing a duck`). PubMed's website works headless (verified: 5 real records extracted). For the blocked engines:
+
+- Use a **visible** Chrome window (the module drives the same CDP Chrome; you complete the CAPTCHA once in the window, then re-run - the session persists).
+- Or use the in-app browser fallback described below.
+- Never hammer the sites; moderate volumes only.
 
 ## Chrome CDP setup (one-time)
 
