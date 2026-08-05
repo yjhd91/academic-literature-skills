@@ -18,6 +18,8 @@ Drives a real Chrome (via DevTools Protocol) to search platforms that have no pu
 
 Selectors change when sites update. If extraction returns 0 results but the page opened, inspect the page manually (in-app browser or Chrome) and update the selectors in `scripts/browser_search.mjs`.
 
+Verified end-to-end (CNKI, 2026-08): after the user completes the slider verification once in a visible CDP Chrome window, `browser-search --engine cnki` returns real records (title/authors/journal/date/abstract URL). The CNKI engine auto-triggers the SPA search (sets the input and dispatches Enter), waits until the results counter (`共找到 N 条结果`) appears, then parses the result table columns (序号/题名/作者/来源/发表时间/...). Expect one manual verification (slider) per browser session.
+
 ## Query translation by target language
 
 `browser-search` auto-translates the query into the engine's language before searching (via the free Google Translate endpoint; `--no-translate` disables it). `translate-query --text "..." --to ja` does standalone translation.

@@ -794,13 +794,18 @@ def cmd_browser_search(args):
         return
     records = []
     for it in data.get("results", []):
+        author_raw = it.get("authors") or ""
+        authors = [x.strip() for x in str(author_raw).split(";") if x.strip()] if isinstance(author_raw, str) else (author_raw or [])
         records.append({
             "id": it.get("url") or it.get("title") or "",
             "source_platform": args.engine,
             "title": it.get("title", ""),
             "url": it.get("url", ""),
             "snippet": it.get("snippet", "") or it.get("meta", ""),
-            "journal": "", "pubDate": "", "authors": [], "doi": "", "abstract": "",
+            "journal": it.get("journal", ""),
+            "pubDate": it.get("pubDate", ""),
+            "authors": authors,
+            "doi": "", "abstract": "",
             "pmid": "", "query": args.query,
         })
     save_records(records, args.out)

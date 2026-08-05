@@ -73,12 +73,27 @@ const ENGINES = {
   },
   "cnki": {
     url: (q) => "https://kns.cnki.net/kns8s/defaultresult/index?kw=" + encodeURIComponent(q),
-    extract: `Array.from(document.querySelectorAll('.result-table-list tbody tr, .list-item, .result-item')).slice(0, ${max}).map(r => {
-      const a = r.querySelector('a[href*="detail"], .name a, a');
-      return { title: a ? a.innerText.trim() : r.innerText.trim().split('\\n')[0], url: a ? a.href : '', snippet: '' };
-    }).filter(x => x.title)`,
-    waitMs: 6000,
-    probe: ".result-table-list tbody tr, .list-item",
+    postNav: (q) => `(() => {
+      const inp = document.querySelector('input[type="text"], input.txt-input, #txt_search');
+      if (!inp) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, ${JSON.stringify(q)});
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.focus();
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      inp.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      return true;
+    })()`,
+    extract: `Array.from(document.querySelectorAll('table tbody tr, #gridTable tr, .result-table-list tr')).slice(0, ${max}).map(r => {
+      const a = r.querySelector('td a, .name a, a');
+      const cells = Array.from(r.querySelectorAll('td')).map(c => c.innerText.trim());
+      const title = a ? a.innerText.trim() : '';
+      if (!title || cells.length < 2) return null;
+      const pick = (i, j) => cells[i] || cells[j] || '';
+      return { title, url: a.href, authors: pick(2, 1), journal: pick(3, 2), pubDate: pick(4, 3), snippet: '' };
+    }).filter(Boolean)`,
+    waitMs: 15000,
+    probe: () => `document.body.innerText.includes('共找到')`,
     needsLogin: true,
   },
   "wanfang": {
@@ -182,10 +197,15 @@ async function run() {
   await send("Page.enable");
   await send("Runtime.enable");
   await send("Page.navigate", { url: targetUrl });
+  if (cfg.postNav) {
+    await new Promise((r) => setTimeout(r, 1500));
+    await send("Runtime.evaluate", { expression: cfg.postNav(query), returnByValue: true });
+  }
+  const probeExpr = typeof cfg.probe === "function" ? cfg.probe() : cfg.probe;
   const start = Date.now();
   while (Date.now() - start < cfg.waitMs) {
     const probeRes = await send("Runtime.evaluate", {
-      expression: `document.querySelectorAll('${cfg.probe}').length > 0`,
+      expression: probeExpr,
       returnByValue: true,
     });
     if (probeRes.result && probeRes.result.result && probeRes.result.result.value === true) {
@@ -196,7 +216,7 @@ async function run() {
   }
   if (opt("debug", "") === "1") {
     const dbg = await send("Runtime.evaluate", {
-      expression: `JSON.stringify({ title: document.title, url: location.href, algo: document.querySelectorAll('li.b_algo').length, docsum: document.querySelectorAll('article.docsum, .docsum-title, .docsum-content').length, body: (document.body ? document.body.innerText.slice(0, 600) : '') })`,
+      expression: `JSON.stringify({ title: document.title, url: location.href, algo: document.querySelectorAll('li.b_algo').length, docsum: document.querySelectorAll('article.docsum, .docsum-title, .docsum-content').length, trs: document.querySelectorAll('table tr').length, rowhtml: (document.querySelector('table tr') ? document.querySelector('table tr').outerHTML.slice(0, 700) : ''), body: (document.body ? document.body.innerText.slice(0, 400) : '') })`,
       returnByValue: true,
     });
     console.error("[debug] " + (dbg.result && dbg.result.result && dbg.result.result.value));
