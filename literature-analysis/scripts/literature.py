@@ -809,7 +809,11 @@ def cmd_browser_search(args):
             "pmid": "", "query": args.query,
         })
     save_records(records, args.out)
-    print(f"browser-search [{args.engine}]: {data.get('count', 0)} results -> {args.out}")
+    total = data.get("total", "")
+    if total:
+        print(f"browser-search [{args.engine}]: 平台共 {total} 条,提取 {data.get('count', 0)} 条 -> {args.out}")
+    else:
+        print(f"browser-search [{args.engine}]: {data.get('count', 0)} results -> {args.out}")
     if data.get("needsLogin"):
         print("Note: this platform usually requires login; finish login in the opened Chrome window and re-run.")
 
@@ -1506,7 +1510,7 @@ def main():
     p_bs = sub.add_parser("browser-search", help="Unified browser search for platforms without APIs (Google Scholar, CNKI, Wanfang, VIP, Bing)")
     p_bs.add_argument("--engine", choices=BROWSER_ENGINES, default="bing")
     p_bs.add_argument("--query", required=True)
-    p_bs.add_argument("--max", type=int, default=20)
+    p_bs.add_argument("--max", type=int, default=50)
     p_bs.add_argument("--port", type=int, default=0, help="Chrome CDP port (default: auto-detect 9222 / DevToolsActivePort)")
     p_bs.add_argument("--url", help="override the search URL")
     p_bs.add_argument("--print-url", action="store_true", help="only print the search URL and exit")

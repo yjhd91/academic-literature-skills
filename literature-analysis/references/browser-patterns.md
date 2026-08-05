@@ -18,7 +18,7 @@ Drives a real Chrome (via DevTools Protocol) to search platforms that have no pu
 
 Selectors change when sites update. If extraction returns 0 results but the page opened, inspect the page manually (in-app browser or Chrome) and update the selectors in `scripts/browser_search.mjs`.
 
-Verified end-to-end (CNKI, 2026-08): after the user completes the slider verification once in a visible CDP Chrome window, `browser-search --engine cnki` returns real records (title/authors/journal/date/abstract URL). The CNKI engine auto-triggers the SPA search (sets the input and dispatches Enter), waits until the results counter (`共找到 N 条结果`) appears, then parses the result table columns (序号/题名/作者/来源/发表时间/...). Expect one manual verification (slider) per browser session.
+Verified end-to-end (CNKI, 2026-08): after the user completes the slider verification once in a visible CDP Chrome window, `browser-search --engine cnki` returns real records (title/authors/journal/date/abstract URL). The CNKI engine auto-triggers the SPA search (sets the input and dispatches Enter), waits until the results counter (`共找到 N 条结果`) appears, parses the result table columns (序号/题名/作者/来源/发表时间/...), and **auto-paginates** through all pages (clicks `下一页` until collected >= `--max` or the last page). Verified: platform total 53, extracted 53 unique records (3 pages, no duplicates). Expect one manual verification (slider) per browser session.
 
 ## Query translation by target language
 

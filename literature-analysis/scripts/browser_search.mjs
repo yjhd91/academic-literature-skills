@@ -94,6 +94,14 @@ const ENGINES = {
     }).filter(Boolean)`,
     waitMs: 15000,
     probe: () => `document.body.innerText.includes('共找到')`,
+    totalExpr: () => `(() => { const m = document.body.innerText.match(/共找到\\s*(\\d+)\\s*条结果/); return m ? m[1] : ''; })()`,
+    nextPage: `(() => {
+      const b = Array.from(document.querySelectorAll('a, button')).find(x => x.innerText && x.innerText.trim() === '下一页')
+                || document.querySelector('#PageNext, .page-next');
+      if (!b || b.getAttribute('aria-disabled') === 'true' || b.disabled) return false;
+      b.click();
+      return true;
+    })()`,
     needsLogin: true,
   },
   "wanfang": {
@@ -223,10 +231,38 @@ async function run() {
   }
   const evalRes = await send("Runtime.evaluate", { expression: cfg.extract, returnByValue: true });
   const items = (evalRes.result && evalRes.result.result && evalRes.result.result.value) || [];
-  const results = items.slice(0, max);
+  let all = items.slice();
+  if (cfg.nextPage) {
+    let guard = 0;
+    const seen = new Set(all.map((x) => x.url));
+    while (all.length < max && guard < 50) {
+      const nx = await send("Runtime.evaluate", { expression: cfg.nextPage, returnByValue: true });
+      const clicked = nx.result && nx.result.result && nx.result.result.value;
+      if (!clicked) break;
+      await new Promise((r) => setTimeout(r, 2500));
+      const more = await send("Runtime.evaluate", { expression: cfg.extract, returnByValue: true });
+      const moreItems = (more.result && more.result.result && more.result.result.value) || [];
+      let added = 0;
+      for (const it of moreItems) {
+        if (!seen.has(it.url)) {
+          seen.add(it.url);
+          all.push(it);
+          added++;
+        }
+      }
+      if (added === 0) break;
+      guard++;
+    }
+  }
+  const results = all.slice(0, max);
+  let total = "";
+  if (cfg.totalExpr) {
+    const t = await send("Runtime.evaluate", { expression: cfg.totalExpr(), returnByValue: true });
+    total = (t.result && t.result.result && t.result.result.value) || "";
+  }
   console.log(JSON.stringify({
     engine, query, targetUrl, port: usedPort, needsLogin: cfg.needsLogin,
-    count: results.length, results,
+    count: results.length, total, results,
   }, null, 2));
   ws.close();
 }
