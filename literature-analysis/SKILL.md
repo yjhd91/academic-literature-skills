@@ -21,6 +21,21 @@ python scripts/literature.py strategy --concepts "radiomics|lung cancer|prognosi
 python scripts/literature.py search-all --queries-file queries.txt --max 15 --out results.json
 ```
 
+For multi-database automation, `strategy` now generates native query variants for every platform at once, and `translate` converts a raw query into each platform's syntax - no manual per-database query writing:
+
+```powershell
+# Generate + test the full multi-platform strategy (MeSH/[tiab] for PubMed, field syntax for arXiv/Europe PMC, quoted terms for OpenAlex/Crossref/DOAJ/HAL/S2)
+python scripts/literature.py strategy --concepts "radiomics|lung cancer|prognosis" --sources pubmed,openalex,crossref,arxiv,semanticscholar,europepmc,doaj,hal --dates "2023/01/01:2026/08/05" --test --strategy-out strategy.json
+
+# Just show the converted queries (optionally with hit counts)
+python scripts/literature.py translate --concepts "radiomics|lung cancer|prognosis" --sources pubmed,arxiv,europepmc --dates "2023/01/01:2026/08/05" --test
+
+# Run the strategy across all platforms and merge
+python scripts/literature.py search-multi --strategy-file strategy.json --max 15 --out results.json
+```
+
+Platform-native conversions handled automatically: PubMed `[Mesh]/[tiab]/[dp]`, arXiv `all:"..." AND submittedDate:[...]`, Europe PMC `(...) AND PUB_YEAR:[...]`, OpenAlex/Crossref/DOAJ/HAL/Semantic Scholar quoted-term queries with their own date parameters.
+
 ## PubMed syntax rules (mandatory when hand-writing queries)
 
 - Boolean: `AND`, `OR`, `NOT` uppercase, spaced, parentheses for grouping: `(a OR b) AND c`.

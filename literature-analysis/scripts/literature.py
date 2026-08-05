@@ -144,6 +144,127 @@ def validate_query(query):
     return issues
 
 
+def parse_dates(s):
+    if not s:
+        return None, None
+    if ":" in s:
+        a, b = [x.strip() or None for x in s.split(":", 1)]
+        return a, b
+    return s, None
+
+
+def split_concepts(query):
+    parts = re.split(r"\s+(?:AND|OR)\s+", query or "", flags=re.I)
+    return [p.strip().strip('"').strip("[]") for p in parts if p.strip()]
+
+
+def date_suffix(platform, date_from, date_to):
+    if not (date_from or date_to):
+        return ""
+    if platform == "pubmed":
+        return f' AND ("{date_from or "0001/01/01"}"[dp] : "{date_to or "9999/12/31"}"[dp])'
+    if platform == "arxiv":
+        s = (date_from or "00010101").replace("/", "")
+        e = (date_to or "99991231").replace("/", "")
+        return f" AND submittedDate:[{s} TO {e}]"
+    if platform == "europepmc":
+        return f" AND PUB_YEAR:[{(date_from or '0001')[:4]} TO {(date_to or '9999')[:4]}]"
+    return ""
+
+
+def build_platform_queries(platform, concepts, date_from, date_to, mesh=None):
+    """Translate concepts into each platform's native query syntax."""
+    mesh = mesh or {}
+    if platform == "pubmed":
+        variants = []
+        parts = []
+        for c in concepts:
+            ms = mesh.get(c) or []
+            parts.append("(" + " OR ".join(f'"{m}"[Mesh]' for m in ms) + ")" if ms else f'("{c}"[tiab])')
+        if parts:
+            variants.append(" AND ".join(parts))
+        variants.append(" AND ".join(f'("{c}"[tiab])' for c in concepts))
+        parts = []
+        for c in concepts:
+            ms = mesh.get(c) or []
+            if ms:
+                parts.append("(" + " OR ".join([f'"{m}"[Mesh]' for m in ms] + [f'"{c}"[tiab]']) + ")")
+            else:
+                parts.append(f'("{c}"[tiab])')
+        variants.append(" AND ".join(parts))
+        suf = date_suffix("pubmed", date_from, date_to)
+        return [v + suf for v in variants]
+    if platform == "arxiv":
+        return [" AND ".join(f'all:"{c}"' for c in concepts) + date_suffix("arxiv", date_from, date_to)]
+    if platform == "europepmc":
+        return [" AND ".join(f'("{c}")' for c in concepts) + date_suffix("europepmc", date_from, date_to)]
+    q = " AND ".join(f'"{c}"' for c in concepts)
+    return [q]
+
+
+def platform_count(platform, query, date_from, date_to):
+    try:
+        if platform == "pubmed":
+            return search_count(query)
+        if platform == "openalex":
+            params = {"search": query, "per-page": 1, "mailto": "research@example.com"}
+            flt = []
+            if date_from:
+                flt.append("from_publication_date:" + date_from.replace("/", "-"))
+            if date_to:
+                flt.append("to_publication_date:" + date_to.replace("/", "-"))
+            if flt:
+                params["filter"] = ",".join(flt)
+            return json.loads(http_get_retry(OPENALEX + "?" + urllib.parse.urlencode(params)))["meta"]["count"]
+        if platform == "crossref":
+            params = {"query.bibliographic": query, "rows": 0, "mailto": "research@example.com"}
+            flt = []
+            if date_from:
+                flt.append("from-pub-date:" + date_from.replace("/", "-"))
+            if date_to:
+                flt.append("until-pub-date:" + date_to.replace("/", "-"))
+            if flt:
+                params["filter"] = ",".join(flt)
+            return json.loads(http_get_retry(CROSSREF + "?" + urllib.parse.urlencode(params)))["message"]["total-results"]
+        if platform == "arxiv":
+            p = {"search_query": query, "max_results": 1, "sortBy": "relevance", "sortOrder": "descending"}
+            root = ET.fromstring(http_get_retry("https://export.arxiv.org/api/query?" + urllib.parse.urlencode(p)))
+            el = root.find("{http://a9.com/-/spec/opensearch/1.1/}totalResults")
+            return el.text if el is not None else "0"
+        if platform == "europepmc":
+            p = {"query": query, "format": "json", "pageSize": 1}
+            return json.loads(http_get_retry("https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(p)))["hitCount"]
+        if platform == "doaj":
+            d = json.loads(http_get_retry("https://doaj.org/api/search/articles/" + urllib.parse.quote(query) + "?pageSize=1"))
+            return d.get("total", 0)
+        if platform == "hal":
+            p = {"q": query, "rows": 0}
+            return json.loads(http_get_retry("https://api.archives-ouvertes.fr/search/?" + urllib.parse.urlencode(p)))["response"]["numFound"]
+        if platform == "semanticscholar":
+            return "N/A (rate-limited without key)"
+    except Exception as exc:
+        return f"error: {exc}"
+    return "0"
+
+
+def build_strategy(concepts, sources, date_from, date_to):
+    mesh = {}
+    if "pubmed" in sources:
+        for c in concepts:
+            mesh[c] = mesh_lookup(c, 3)
+            time.sleep(0.4)
+    queries = {}
+    for s in sources:
+        queries[s] = build_platform_queries(s, concepts, date_from, date_to, mesh)
+    return {
+        "topic": " | ".join(concepts),
+        "dates": f"{date_from or ''}:{date_to or ''}".strip(":"),
+        "sources": sources,
+        "mesh": mesh,
+        "queries": queries,
+    }
+
+
 def load_records(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -209,61 +330,60 @@ def cmd_search_all(args):
 
 
 def cmd_strategy(args):
-    """Build PubMed-syntax query variants from topic concepts (MeSH + [tiab] + Boolean + [dp])."""
+    """Automated strategy generation: translate concepts into every platform's native query syntax."""
     concepts = [c.strip() for c in re.split(r"[|,]", args.concepts) if c.strip()]
     if len(concepts) < 1:
         sys.exit("No concepts given (use --concepts 'radiomics|lung cancer|prognosis').")
-    mesh_by_concept = {}
-    for c in concepts:
-        mesh_by_concept[c] = mesh_lookup(c, args.max_mesh)
-        time.sleep(0.4)
-    dp = ""
-    if args.dates:
-        if ":" in args.dates:
-            start, end = [x.strip() for x in args.dates.split(":", 1)]
-            dp = f' AND ("{start}"[dp] : "{end}"[dp])'
-        else:
-            dp = f' AND "{args.dates.strip()}"[dp]'
+    sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+    date_from, date_to = parse_dates(args.dates)
+    strategy = build_strategy(concepts, sources, date_from, date_to)
 
-    variants = []
-    # Variant 1: MeSH-only (max recall via descriptor mapping)
-    parts = []
-    for c in concepts:
-        ms = mesh_by_concept[c]
-        parts.append("(" + " OR ".join(f'"{m}"[Mesh]' for m in ms) + ")" if ms else f'("{c}"[tiab])')
-    if parts:
-        variants.append(" AND ".join(parts) + dp)
-    # Variant 2: [tiab] only (explicit terms, higher precision)
-    variants.append(" AND ".join(f'("{c}"[tiab])' for c in concepts) + dp)
-    # Variant 3: hybrid MeSH OR [tiab]
-    parts = []
-    for c in concepts:
-        ms = mesh_by_concept[c]
-        if ms:
-            ors = [f'"{m}"[Mesh]' for m in ms] + [f'"{c}"[tiab]']
-            parts.append("(" + " OR ".join(ors) + ")")
-        else:
-            parts.append(f'("{c}"[tiab])')
-    variants.append(" AND ".join(parts) + dp)
-
-    print("MeSH descriptors found:")
-    for c in concepts:
-        print(f"  {c}: {', '.join(mesh_by_concept[c]) if mesh_by_concept[c] else '(none; will use [tiab] only)'}")
-    if args.out:
+    print(f"主题/Concepts: {' | '.join(concepts)}  日期/Dates: {args.dates or '不限'}")
+    if strategy["mesh"]:
+        print("MeSH descriptors found:")
+        for c in concepts:
+            print(f"  {c}: {', '.join(strategy['mesh'].get(c, [])) if strategy['mesh'].get(c) else '(none; will use [tiab] only)'}")
+    for s in sources:
+        for i, q in enumerate(strategy["queries"].get(s, []), 1):
+            issues = validate_query(q)
+            tag = ("  WARN: " + "; ".join(issues)) if issues else ""
+            if args.test:
+                time.sleep(0.4)
+                print(f"[{s} #{i}] count={platform_count(s, q, date_from, date_to)}  {q}{tag}")
+            else:
+                print(f"[{s} #{i}]  {q}{tag}")
+    if args.out and "pubmed" in strategy["queries"]:
         with open(args.out, "w", encoding="utf-8") as f:
-            f.write("\n".join(variants) + "\n")
-        print(f"\nQuery strategy saved to {args.out} ({len(variants)} variants)")
-    print("\nVariants:")
-    for v in variants:
-        issues = validate_query(v)
-        tag = ("  WARN: " + "; ".join(issues)) if issues else ""
-        if args.test:
-            time.sleep(0.4)
-            c = search_count(v)
-            zero = "  <-- ZERO RESULTS, refine or drop" if c == "0" else ""
-            print(f"  count={c}  {v}{zero}{tag}")
-        else:
-            print(f"  {v}{tag}")
+            f.write("\n".join(strategy["queries"]["pubmed"]) + "\n")
+        print(f"\nPubMed query strategy saved to {args.out} (for search-all --queries-file)")
+    if args.strategy_out:
+        with open(args.strategy_out, "w", encoding="utf-8") as f:
+            json.dump(strategy, f, ensure_ascii=False, indent=2)
+        print(f"Multi-platform strategy saved to {args.strategy_out} (for search-multi --strategy-file)")
+
+
+def cmd_translate(args):
+    """Translate a query into every selected platform's native syntax."""
+    if args.concepts:
+        concepts = [c.strip() for c in re.split(r"[|,]", args.concepts) if c.strip()]
+    else:
+        concepts = split_concepts(args.query)
+    if not concepts:
+        sys.exit("Provide --concepts or --query.")
+    sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+    date_from, date_to = parse_dates(args.dates)
+    strategy = build_strategy(concepts, sources, date_from, date_to)
+    print(f"原始检索词/Raw: {' | '.join(concepts)}  日期/Dates: {args.dates or '不限'}")
+    for s in sources:
+        for i, q in enumerate(strategy["queries"].get(s, []), 1):
+            extra = ""
+            if args.test:
+                extra = f"   count={platform_count(s, q, date_from, date_to)}"
+            print(f"[{s} #{i}]{extra}\n  {q}")
+    if args.strategy_out:
+        with open(args.strategy_out, "w", encoding="utf-8") as f:
+            json.dump(strategy, f, ensure_ascii=False, indent=2)
+        print(f"\nStrategy JSON saved to {args.strategy_out}")
 
 
 def cmd_author_search(args):
@@ -884,8 +1004,8 @@ def crossref_search(query, max_results, date_from, date_to, sort):
 
 
 def arxiv_search(query, max_results, date_from, date_to, sort):
-    q = f'all:"{query}"'
-    if date_from or date_to:
+    q = query if (":" in query or " AND " in query.upper()) else f'all:"{query}"'
+    if (date_from or date_to) and "submittedDate" not in q:
         d1 = (date_from or "00010101").replace("/", "")
         d2 = (date_to or "99991231").replace("/", "")
         q += f" AND submittedDate:[{d1} TO {d2}]"
@@ -973,7 +1093,7 @@ def semanticscholar_search(query, max_results, date_from, date_to, sort):
 
 def europepmc_search(query, max_results, date_from, date_to, sort):
     q = query
-    if date_from or date_to:
+    if (date_from or date_to) and "PUB_YEAR:" not in q.upper():
         q += f" AND PUB_YEAR:[{(date_from or '0001')[:4]} TO {(date_to or '9999')[:4]}]"
     params = {"query": q, "format": "json", "pageSize": max_results, "resultType": "core"}
     url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(params)
@@ -1093,38 +1213,50 @@ def cmd_enrich(args):
 
 
 def cmd_search_multi(args):
-    """Search PubMed/OpenAlex/Crossref for one query, merge by DOI/title, deduplicate."""
-    sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+    """Search multiple sources (strategy-driven or single query), merge by DOI/title, deduplicate."""
+    strategy = None
+    if args.strategy_file:
+        with open(args.strategy_file, "r", encoding="utf-8") as f:
+            strategy = json.load(f)
+        sources = strategy.get("sources") or list(strategy.get("queries", {}).keys())
+        date_from, date_to = parse_dates(strategy.get("dates"))
+    else:
+        sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+        date_from, date_to = args.date_from, args.date_to
+    if strategy is None and not args.query:
+        sys.exit("Provide --query or --strategy-file.")
     if not sources:
         sys.exit("No sources given (use --sources pubmed,openalex,crossref).")
     merged = {}
     for src in sources:
-        if src == "pubmed":
-            recs = run_pubmed_search(args.query, args.max)
+        queries = (strategy["queries"].get(src, []) if strategy else []) or [args.query]
+        for q in queries:
+            if src == "pubmed":
+                recs = run_pubmed_search(q, args.max)
+                for r in recs:
+                    r["source_platform"] = "pubmed"
+            elif src == "openalex":
+                recs = openalex_search(q, args.max, date_from, date_to, args.sort)
+            elif src == "crossref":
+                recs = crossref_search(q, args.max, date_from, date_to, args.sort)
+            elif src == "arxiv":
+                recs = arxiv_search(q, args.max, date_from, date_to, args.sort)
+            elif src == "semanticscholar":
+                recs = semanticscholar_search(q, args.max, date_from, date_to, args.sort)
+            elif src == "europepmc":
+                recs = europepmc_search(q, args.max, date_from, date_to, args.sort)
+            elif src == "doaj":
+                recs = doaj_search(q, args.max, date_from, date_to, args.sort)
+            elif src == "hal":
+                recs = hal_search(q, args.max, date_from, date_to, args.sort)
+            else:
+                print(f"  unknown source {src!r}, skipped")
+                continue
+            print(f"  {src}: {len(recs)} records")
             for r in recs:
-                r["source_platform"] = "pubmed"
-        elif src == "openalex":
-            recs = openalex_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        elif src == "crossref":
-            recs = crossref_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        elif src == "arxiv":
-            recs = arxiv_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        elif src == "semanticscholar":
-            recs = semanticscholar_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        elif src == "europepmc":
-            recs = europepmc_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        elif src == "doaj":
-            recs = doaj_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        elif src == "hal":
-            recs = hal_search(args.query, args.max, args.date_from, args.date_to, args.sort)
-        else:
-            print(f"  unknown source {src!r}, skipped")
-            continue
-        print(f"  {src}: {len(recs)} records")
-        for r in recs:
-            r["query"] = args.query
-            key = (r.get("doi") or "").lower() or r.get("id") or r.get("pmid") or (r.get("title") or "").lower()
-            merged.setdefault(key, r)
+                r["query"] = q
+                key = (r.get("doi") or "").lower() or r.get("id") or r.get("pmid") or (r.get("title") or "").lower()
+                merged.setdefault(key, r)
     records = list(merged.values())
     if args.sort == "citations":
         records.sort(key=lambda r: (r.get("citation_count") if isinstance(r.get("citation_count"), int) else -1), reverse=True)
@@ -1271,10 +1403,21 @@ def main():
     p_strategy = sub.add_parser("strategy", help="Build PubMed-syntax query variants from topic concepts")
     p_strategy.add_argument("--concepts", required=True, help="pipe- or comma-separated concepts, e.g. 'radiomics|lung cancer|prognosis'")
     p_strategy.add_argument("--dates", help="date range, e.g. '2023/01/01:2026/08/05' or single date '2023/01/01'")
+    p_strategy.add_argument("--sources", default="pubmed,openalex,crossref,arxiv,semanticscholar,europepmc,doaj,hal", help="platforms to generate queries for")
     p_strategy.add_argument("--max-mesh", type=int, default=3)
     p_strategy.add_argument("--out", help="save query variants to a file (one per line) for search-all --queries-file")
+    p_strategy.add_argument("--strategy-out", help="save multi-platform strategy JSON for search-multi --strategy-file")
     p_strategy.add_argument("--test", action="store_true", help="run each variant against PubMed and print hit counts")
     p_strategy.set_defaults(func=cmd_strategy)
+
+    p_translate = sub.add_parser("translate", help="Translate a query into every selected platform's native syntax")
+    p_translate.add_argument("--query", help="raw query (concepts auto-split on AND/OR)")
+    p_translate.add_argument("--concepts", help="pipe- or comma-separated concepts (alternative to --query)")
+    p_translate.add_argument("--dates", help="date range, e.g. '2023/01/01:2026/08/05'")
+    p_translate.add_argument("--sources", default="pubmed,openalex,crossref,arxiv,semanticscholar,europepmc,doaj,hal")
+    p_translate.add_argument("--strategy-out", help="save strategy JSON for search-multi --strategy-file")
+    p_translate.add_argument("--test", action="store_true", help="print hit counts for each translated query")
+    p_translate.set_defaults(func=cmd_translate)
 
     p_author = sub.add_parser("author-search", help="Directed search for a specific author, optionally at an institution")
     p_author.add_argument("--author", required=True, help="author in 'Last FM' format, e.g. 'Aerts HJWL'")
@@ -1296,7 +1439,8 @@ def main():
     p_export.set_defaults(func=cmd_export)
 
     p_multi = sub.add_parser("search-multi", help="Search PubMed/OpenAlex/Crossref and merge by DOI")
-    p_multi.add_argument("--query", required=True)
+    p_multi.add_argument("--query", help="single query (alternative to --strategy-file)")
+    p_multi.add_argument("--strategy-file", help="run queries from a strategy JSON (generated by strategy/translate)")
     p_multi.add_argument("--sources", default="pubmed,openalex,crossref")
     p_multi.add_argument("--max", type=int, default=10)
     p_multi.add_argument("--from", dest="date_from", help="start date YYYY/MM/DD")
