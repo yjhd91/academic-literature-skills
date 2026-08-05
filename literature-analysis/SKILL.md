@@ -106,13 +106,15 @@ python scripts/literature.py browser-search --engine pubmed-web --query "radiomi
 python scripts/literature.py browser-search --engine google-scholar --query "radiomics lung cancer prognosis" --max 20 --out gs.json
 
 # CNKI / Wanfang / VIP (need login once in the CDP Chrome window)
-python scripts/literature.py browser-search --engine cnki --query "肺结节 AI 诊断" --max 20 --out cnki.json
+python scripts/literature.py browser-search --engine cnki --query "肺结节 AI 诊断" --max 50 --out cnki.json --xlsx cnki.xlsx
 
 # Print the URL without driving the browser
 python scripts/literature.py browser-search --engine cnki --query "肺结节" --print-url
 ```
 
 The query is auto-translated into the engine's language: CNKI/Wanfang/VIP automatically translate to Chinese (`radiomics lung cancer prognosis` -> `放射组学肺癌预后`); standalone translation via `translate-query --text "..." --to ja|de|fr|ru|zh-CN`.
+
+`--xlsx` also writes a formatted Excel workbook (source/title/authors/journal/pubDate/url/snippet/query); multi-page results are auto-paginated and deduplicated (CNKI verified: 53/53).
 
 Requirements: Chrome started with `--remote-debugging-port=9222 --user-data-dir="D:\chrome-cdp"` (see `references/browser-patterns.md`), Node.js 22+. Headless Chrome is CAPTCHA-blocked by Bing/DuckDuckGo/Google Scholar - complete the challenge once in the visible CDP Chrome window and re-run, or use the in-app browser fallback documented in `references/browser-patterns.md`; results saved as standard JSON still merge into `extract` / `overview`.
 

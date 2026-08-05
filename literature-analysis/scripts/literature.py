@@ -809,6 +809,19 @@ def cmd_browser_search(args):
             "pmid": "", "query": args.query,
         })
     save_records(records, args.out)
+    if args.xlsx:
+        header = ["source", "title", "authors", "journal", "pubDate", "url", "snippet", "query"]
+        rows = [[
+            r.get("source_platform", ""),
+            r.get("title", ""),
+            "; ".join(r.get("authors") or []),
+            r.get("journal", ""),
+            r.get("pubDate", ""),
+            r.get("url", ""),
+            r.get("snippet", ""),
+            r.get("query", ""),
+        ] for r in records]
+        write_xlsx(args.xlsx, header, rows, widths=[10, 50, 30, 24, 12, 55, 45, 30])
     total = data.get("total", "")
     if total:
         print(f"browser-search [{args.engine}]: 平台共 {total} 条,提取 {data.get('count', 0)} 条 -> {args.out}")
@@ -904,7 +917,7 @@ def cmd_extract(args):
     print("Heuristic extraction is a first pass; the agent reviews and refines cells, decisions, and reasons.")
 
 
-def write_xlsx(path, header, rows):
+def write_xlsx(path, header, rows, widths=None):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -919,7 +932,9 @@ def write_xlsx(path, header, rows):
         cell.fill = PatternFill("solid", fgColor="2F6DB3")
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    for i, w in enumerate([10, 45, 22, 10, 20, 60] + [18] * len(OVERVIEW_FIELDS), start=1):
+    if widths is None:
+        widths = [10, 45, 22, 10, 20, 60] + [18] * len(OVERVIEW_FIELDS)
+    for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = min(w, 45)
     wb.save(path)
     print(f"Excel written to {path}")
@@ -1516,6 +1531,7 @@ def main():
     p_bs.add_argument("--print-url", action="store_true", help="only print the search URL and exit")
     p_bs.add_argument("--no-translate", action="store_true", help="disable auto-translation of the query to the engine's language")
     p_bs.add_argument("--out", default="browser_results.json")
+    p_bs.add_argument("--xlsx", help="also write the results as a formatted Excel file")
     p_bs.set_defaults(func=cmd_browser_search)
 
     p_tq = sub.add_parser("translate-query", help="Translate a query for language-specific databases")
