@@ -6,7 +6,7 @@
 Multi-source, multilingual, multi-database academic literature search and analysis skills for Codex / Claude Code:
 **auto search-strategy generation → API search → browser-assisted paginated scraping → precise abstract extraction → screening → summarized delivery**.
 
-> **开发者 / Developers**：解放军总医院第一医学中心 & 南开大学医学院团队（PLA General Hospital First Medical Center & Nankai University School of Medicine）。
+> **开发者 / Developers**：解放军总医院第一医学中心 & 南开大学医学院团队（PLA General Hospital First Medical Center & Nankai University School of Medicine）。采用AI辅助编写和完成本项目。
 > **早期思路来源 / Early inspiration**：[ustc-ai4science/academic-search](https://github.com/ustc-ai4science/academic-search)。
 > **开源声明 / License & Attribution**：本项目完全开源，允许任何形式的二次开发和使用；使用时请注明来源。
 > Fully open source. Any form of secondary development and use is permitted; please credit the source when you use it.
