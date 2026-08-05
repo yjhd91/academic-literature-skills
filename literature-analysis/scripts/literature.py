@@ -26,10 +26,13 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 SKILLS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PUBMED_SCRIPT = os.path.join(SKILLS_ROOT, "pubmed-live", "scripts", "pubmed.py")
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+OPENALEX = "https://api.openalex.org/works"
+CROSSREF = "https://api.crossref.org/works"
 TOOL = "codex-literature-analysis"
 
 DEFAULT_FIELDS = [
@@ -52,17 +55,47 @@ OVERVIEW_FIELDS = [
     "performance metrics",
     "main findings",
     "limitations",
+    "evidence level",
+    "citation count",
+    "open access status",
     "topic relevance",
     "decision",
     "reason",
     "evidence",
 ]
 
+AUTO_FILL = {"citation count": "citation_count", "open access status": "oa_status"}
+
 
 def http_get(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": TOOL})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def http_get_retry(url, tries=3, timeout=30):
+    """GET with polite backoff for 429/timeout (failure-signal handling)."""
+    last = None
+    for i in range(tries):
+        try:
+            return http_get(url, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            last = exc
+            if exc.code == 429:
+                time.sleep(2 * (i + 1))
+                continue
+            raise
+        except Exception as exc:  # timeout / connection error
+            last = exc
+            time.sleep(2 * (i + 1))
+    raise last
+
+
+def first_str(v):
+    """Return the first element of a list value, or the scalar; empty string if None."""
+    if isinstance(v, list):
+        return v[0] if v else ""
+    return v or ""
 
 
 def mesh_lookup(concept, max_mesh=3):
@@ -137,15 +170,19 @@ def cmd_fetch(args):
 
 
 def run_pubmed_search(query, max_results):
-    proc = subprocess.run(
-        [sys.executable, PUBMED_SCRIPT, "search", query, "--max", str(max_results), "--format", "json"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"pubmed-live search failed for {query!r}: {proc.stderr.strip()}")
-    return json.loads(proc.stdout)
+    last = None
+    for attempt in range(3):
+        proc = subprocess.run(
+            [sys.executable, PUBMED_SCRIPT, "search", query, "--max", str(max_results), "--format", "json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if proc.returncode == 0:
+            return json.loads(proc.stdout)
+        last = RuntimeError(f"pubmed-live search failed for {query!r}: {proc.stderr.strip()}")
+        time.sleep(2 * (attempt + 1))
+    raise last
 
 
 def cmd_search_all(args):
@@ -162,6 +199,8 @@ def cmd_search_all(args):
         recs = run_pubmed_search(q, args.max)
         print(f"  {q!r}: {len(recs)} records")
         for r in recs:
+            r["query"] = q
+            r["source_platform"] = "pubmed"
             merged[r["pmid"]] = r
     records = list(merged.values())
     save_records(records, args.out)
@@ -291,23 +330,841 @@ def cmd_overview(args):
     """Build the standard literature-overview table (fixed comprehensive schema)."""
     records = load_records(args.input)
     header = ["pmid", "title", "journal", "pubDate", "doi", "abstract"] + OVERVIEW_FIELDS
+    rows = []
     with open(args.out, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         for r in records:
             row = [
-                r.get("pmid", ""),
-                r.get("title", ""),
-                r.get("journal", ""),
-                r.get("pubDate", ""),
-                r.get("doi", ""),
-                r.get("abstract", ""),
+                first_str(r.get("pmid")),
+                first_str(r.get("title")),
+                first_str(r.get("journal")),
+                first_str(r.get("pubDate")),
+                first_str(r.get("doi")),
+                first_str(r.get("abstract")),
             ]
-            row += [""] * len(OVERVIEW_FIELDS)
+            for field in OVERVIEW_FIELDS:
+                row.append(first_str(r.get(AUTO_FILL[field])) if field in AUTO_FILL else "")
             writer.writerow(row)
+            rows.append(row)
+    if args.xlsx:
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill
+            from openpyxl.utils import get_column_letter
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Literature Overview"
+            ws.append(header)
+            for row in rows:
+                ws.append(row)
+            for cell in ws[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="2F6DB3")
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            widths = [10, 45, 22, 10, 20, 60] + [18] * len(OVERVIEW_FIELDS)
+            for i, w in enumerate(widths, start=1):
+                ws.column_dimensions[get_column_letter(i)].width = min(w, 45)
+            wb.save(args.xlsx)
+            print(f"Excel written to {args.xlsx}")
+        except ImportError:
+            print("openpyxl not available; only CSV written")
     print(f"Overview table written to {args.out} ({len(records)} rows)")
     print("Columns: " + ", ".join(OVERVIEW_FIELDS))
     print("The agent fills every cell from the abstract text with verbatim evidence; absent info is marked 'Not stated'.")
+
+
+def cmd_download_pdf(args):
+    """Batch-download legal open-access PDFs (only records with an OA PDF URL)."""
+    import urllib.error as urlerror
+    records = load_records(args.input)
+    os.makedirs(args.dir, exist_ok=True)
+    manifest = []
+    n_ok = n_skip = n_fail = 0
+    for r in records:
+        ident = r.get("pmid") or r.get("doi") or r.get("id") or "record"
+        url = r.get("oa_pdf_url") or ""
+        if not url:
+            n_skip += 1
+            manifest.append({"id": ident, "title": r.get("title", ""), "status": "skipped_no_open_pdf", "path": "", "error": ""})
+            continue
+        safe = re.sub(r'[^A-Za-z0-9._-]+', "_", str(ident))[:80]
+        path = os.path.join(args.dir, safe + ".pdf")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; codex-literature-analysis)"})
+            with urllib.request.urlopen(req, timeout=args.timeout) as resp, open(path, "wb") as f:
+                data = resp.read()
+                f.write(data)
+            if not data.startswith(b"%PDF"):
+                os.remove(path)
+                n_fail += 1
+                manifest.append({"id": ident, "title": r.get("title", ""), "status": "not_pdf", "path": "", "error": "downloaded content is not a PDF"})
+            else:
+                n_ok += 1
+                manifest.append({"id": ident, "title": r.get("title", ""), "status": "downloaded", "path": path, "error": ""})
+        except (urlerror.HTTPError, urlerror.URLError, OSError, TimeoutError) as exc:
+            n_fail += 1
+            manifest.append({"id": ident, "title": r.get("title", ""), "status": "failed", "path": "", "error": str(exc)})
+        time.sleep(0.3)
+    manifest_path = os.path.join(args.dir, "download_manifest.csv")
+    with open(manifest_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["id", "title", "status", "path", "error"])
+        writer.writeheader()
+        writer.writerows(manifest)
+    print(f"PDFs: {n_ok} downloaded, {n_skip} skipped (no OA link), {n_fail} failed")
+    print(f"Manifest: {manifest_path}")
+
+
+MODALITY_TERMS = ["PET/CT", "FDG-PET", "PET", "chest CT", "CT", "MRI", "T1/T2", "ultrasound",
+                  "X-ray", "whole slide", "H&E", "pathology", "ctDNA", "radiomics", "endoscopy",
+                  "mammography", "SPECT", "molecular imaging"]
+
+METHOD_TERMS = ["LASSO-Cox", "LASSO", "logistic regression", "Cox proportional hazards", "Cox regression",
+                "nomogram", "deep learning", "convolutional neural network", "CNN", "random forest",
+                "support vector machine", "ensemble", "generative adversarial network", "GAN", "transformer",
+                "machine learning", "radiomics signature", "habitat radiomics", "neural network",
+                "stepwise logistic regression", "linear regression", "genomic signature"]
+
+POP_TERMS = ["non-small cell lung cancer", "nsclc", "small cell lung cancer", "sclc", "lung cancer",
+             "brain metastases", "colorectal cancer", "breast cancer", "prostate cancer", "hepatocellular carcinoma",
+             "pancreatic cancer", "gastric cancer", "esophageal cancer", "head and neck cancer", "ovarian cancer",
+             "renal cell carcinoma", "melanoma", "lymphoma", "leukemia", "covid-19", "pneumonia", "pulmonary fibrosis",
+             "copd", "alzheimer", "parkinson", "stroke", "diabetes", "heart failure", "immunotherapy", "immune checkpoint"]
+
+
+def extract_study_design(text):
+    t = text.lower()
+    if "systematic review" in t or "meta-analysis" in t or "meta analysis" in t:
+        return "Systematic review / meta-analysis"
+    if (re.search(r"randomi[sz]ed\s+(?:open-label\s+)?controlled", t) or "randomized clinical trial" in t
+            or "randomised clinical trial" in t):
+        return "Randomized controlled trial"
+    if "clinical guideline" in t or "practice guideline" in t:
+        return "Clinical guideline"
+    if "case-control" in t or "case control" in t:
+        return "Case-control study"
+    if "cross-sectional" in t or "cross sectional" in t:
+        return "Cross-sectional study"
+    ppos = t.find("prospective")
+    rpos = t.find("retrospective")
+    if rpos != -1 and (ppos == -1 or rpos < ppos):
+        design = "Retrospective cohort study"
+    elif ppos != -1:
+        design = "Prospective cohort study"
+    elif "cohort" in t:
+        design = "Cohort study"
+    elif "case series" in t:
+        design = "Case series"
+    elif "case report" in t:
+        design = "Case report"
+    elif "narrative review" in t or "this review" in t or "we reviewed" in t or "review focuses" in t:
+        design = "Narrative review"
+    elif "proof of concept" in t or "proof-of-concept" in t:
+        design = "Proof of concept"
+    else:
+        design = "Not stated"
+    is_multi = any(k in t for k in ["multi-center", "multicenter", "multi-centre", "multicentre", "multi-institutional", "multi institutional", "from three sites", "four academic medical centers"])
+    if is_multi:
+        design = design + " (multi-center)" if design != "Not stated" else "Multi-center study"
+    return design
+
+
+def extract_sample_size(text):
+    for pat in [r"total of\s*([\d,]+)",
+                r"([\d,]+)\s*(?:patients?|participants?)\s+(?:were|was|underwent|received|treated|diagnosed|included|enrolled|collected|analyzed|with|who|receiving)",
+                r"([\d,]+)\s*samples?\s+(?:were|was|are|collected|analyzed)",
+                r"cohort of\s*([\d,]+)",
+                r"n\s*=\s*([\d,]+)",
+                r"N\s*=\s*([\d,]+)",
+                r"included\s*([\d,]+)"]:
+        m = re.search(pat, text, re.I)
+        if m:
+            return m.group(1).replace(",", "")
+    return "Not stated"
+
+
+def extract_modality(text):
+    found = [m for m in MODALITY_TERMS if re.search(r"\b" + re.escape(m) + r"\b", text, re.I)]
+    return ", ".join(dict.fromkeys(found)) or "Not stated"
+
+
+def extract_method(text):
+    found = [m for m in METHOD_TERMS if re.search(r"\b" + re.escape(m) + r"\b", text, re.I)]
+    return ", ".join(dict.fromkeys(found)) or "Not stated"
+
+
+def extract_population(text):
+    m = re.search(r"patients?\s+(?:with|undergoing|treated with|diagnosed with|receiving)\s+([^.;]{3,80})", text, re.I)
+    if m:
+        return " ".join(m.group(1).split())[:100]
+    t = text.lower()
+    hits = [p for p in POP_TERMS if p in t]
+    if hits:
+        return hits[0] + (" (and others)" if len(hits) > 1 else "")
+    return "Not stated"
+
+
+def extract_validation(text):
+    t = text.lower()
+    has_ext = ("external validation" in t or "externally validated" in t or "external test" in t
+               or ("external" in t and ("validat" in t or "testing set" in t)))
+    has_int = "internal validation" in t or "internally validated" in t or ("internal" in t and "validat" in t)
+    has_ind = "independent validation" in t or "independent test" in t or "independent external" in t or "two independent validation" in t
+    has_test = "test set" in t or "testing set" in t or "test dataset" in t or "held-out" in t or "validation set" in t or "validation cohort" in t
+    if has_ext and (has_int or has_ind or has_test):
+        return "Internal + external validation"
+    if has_ext:
+        return "External validation"
+    if has_ind:
+        return "Independent validation"
+    if has_int:
+        return "Internal validation"
+    if has_test:
+        return "Validation split (unspecified)"
+    if "validation" in t:
+        return "Validation (unspecified)"
+    return "Not stated"
+
+
+def extract_metrics(text):
+    items = []
+    patterns = [
+        ("AUC", r"aucs?\s*(?:of|:|=)?\s*([\d.]+)"),
+        ("AUC", r"area under the (?:receiver operating characteristic |operating characteristic )?curve[^.]*?([\d.]+)"),
+        ("C-index", r"c-?index\s*(?:of|:|=)?\s*([\d.]+)"),
+        ("HR", r"\bhr\b\s*(?:of|:|=)?\s*([\d.]+)"),
+        ("HR", r"hazard ratio[^.]*?([\d.]+)"),
+        ("accuracy", r"accurac\w*\s*(?:of|:|=)?\s*([\d.]+)"),
+        ("sensitivity", r"sensitivit\w*\s*(?:of|:|=)?\s*([\d.]+)"),
+        ("specificity", r"specificit\w*\s*(?:of|:|=)?\s*([\d.]+)"),
+    ]
+    for name, pat in patterns:
+        for m in re.finditer(pat, text, re.I):
+            val = m.group(1)
+            item = f"{name} {val}"
+            if item not in items:
+                items.append(item)
+            if len(items) >= 6:
+                break
+        if len(items) >= 6:
+            break
+    return "; ".join(items) or "Not stated"
+
+
+def extract_findings(text):
+    m = re.search(r"(?:CONCLUSIONS?|INTERPRETATION|CONCLUSION|SUMMARY):\s*(.{20,500})", text, re.I | re.S)
+    if m:
+        return " ".join(m.group(1).split())[:320]
+    sents = re.split(r"(?<=[.!?])\s+", text.strip())
+    tail = " ".join(sents[-2:]).strip()
+    return tail[:320] if tail else "Not stated"
+
+
+def extract_limitations(text):
+    m = re.search(r"[^.!?]*?(?:limitation|limited by|retrospective design|small sample|proof-of-concept|proof of concept)[^.!?]*", text, re.I)
+    if m:
+        return " ".join(m.group(0).split())[:200]
+    return "Not stated"
+
+
+def evidence_level(design, validation):
+    d = (design or "").lower()
+    v = (validation or "").lower()
+    if "guideline" in d:
+        return 1
+    if "systematic review" in d or "meta-analysis" in d:
+        return 2
+    if "randomized" in d:
+        return 3
+    if "prospective" in d:
+        return 4 if "external" in v else 5
+    if "retrospective" in d or "cohort" in d:
+        return 5 if "external" in v else 6
+    if "case-control" in d or "cross-sectional" in d or "case series" in d or "case report" in d:
+        return 7
+    if "review" in d or "proof of concept" in d:
+        return 8
+    return "unclear"
+
+
+def auto_evidence_snippets(text):
+    snippets = []
+    m = re.search(r"[^.!?]*?n\s*=\s*[\d,]+[^.!?]*", text, re.I)
+    if m:
+        snippets.append(" ".join(m.group(0).split())[:90])
+    m = re.search(r"[^.!?]*?aucs?[^.!?]*[\d.]+[^.!?]*", text, re.I)
+    if m:
+        snippets.append(" ".join(m.group(0).split())[:90])
+    m = re.search(r"[^.!?]*?external validation[^.!?]*", text, re.I)
+    if m:
+        snippets.append(" ".join(m.group(0).split())[:90])
+    return " | ".join(dict.fromkeys(snippets))[:400]
+
+
+EXTRACT_FIELDS = [
+    "study design", "population", "sample size", "imaging modality / data", "method / model",
+    "validation", "performance metrics", "main findings", "limitations", "evidence level",
+]
+
+STOPWORDS = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "to", "by", "from",
+             "vs", "versus", "using", "based", "its", "their", "this", "that", "we", "our",
+             "study", "studies", "patients", "cancer", "with", "new", "novel", "analysis"}
+
+
+def topic_score(topic, text):
+    toks = [t for t in re.findall(r"[a-z]{3,}", (topic or "").lower()) if t not in STOPWORDS]
+    if not toks:
+        return None
+    low = (text or "").lower()
+    return sum(1 for t in toks if t in low) / len(toks)
+
+
+def topic_relevance(score):
+    if score is None:
+        return "unclear"
+    if score >= 0.7:
+        return "High"
+    if score >= 0.4:
+        return "Medium"
+    return "Low"
+
+
+def cmd_extract(args):
+    """One-shot auto-extraction: fill the overview fields from abstract text with rules."""
+    records = load_records(args.input)
+    header = ["source", "pmid", "title", "journal", "pubDate", "doi", "abstract"] + OVERVIEW_FIELDS
+    rows = []
+    include_kws = [k.lower() for k in (args.include or "").split("|") if k.strip()]
+    exclude_kws = [k.lower() for k in (args.exclude or "").split("|") if k.strip()]
+    topic = args.topic or (records[0].get("query", "") if records else "") or ""
+    for r in records:
+        abstract = re.sub(r"<[^>]+>", " ", first_str(r.get("abstract")))
+        abstract = " ".join(abstract.split())
+        full = first_str(r.get("title")) + " " + abstract
+        design = extract_study_design(full)
+        validation = extract_validation(full)
+        level = evidence_level(design, validation)
+        score = topic_score(topic, full)
+        rel = topic_relevance(score)
+        text_low = full.lower()
+        exc_hits = [k for k in exclude_kws if k in text_low]
+        inc_hits = [k for k in include_kws if k in text_low]
+        if exc_hits:
+            decision, reason = "exclude", f"matched exclusion criteria: {', '.join(exc_hits)}"
+        elif include_kws and not inc_hits:
+            decision, reason = "uncertain", "no inclusion criterion matched"
+        elif inc_hits:
+            decision, reason = "include", f"matched inclusion criteria: {', '.join(inc_hits)}"
+        elif not abstract.strip():
+            decision, reason = "uncertain", "no abstract available to screen"
+        elif rel == "Low":
+            decision, reason = "exclude", f"low topic relevance (score {score:.2f})"
+        else:
+            decision, reason = "include", f"topic relevance {rel} (score {score:.2f}); evidence level {level}"
+        fields = {
+            "study design": design,
+            "population": extract_population(full),
+            "sample size": extract_sample_size(full),
+            "imaging modality / data": extract_modality(full),
+            "method / model": extract_method(full),
+            "validation": validation,
+            "performance metrics": extract_metrics(full),
+            "main findings": extract_findings(abstract),
+            "limitations": extract_limitations(abstract),
+            "evidence level": level,
+            "citation count": r.get("citation_count", ""),
+            "open access status": r.get("oa_status", ""),
+            "topic relevance": rel,
+            "decision": decision,
+            "reason": reason,
+        }
+        row = [
+            first_str(r.get("source_platform")) or "pubmed",
+            first_str(r.get("pmid")), first_str(r.get("title")), first_str(r.get("journal")),
+            first_str(r.get("pubDate")), first_str(r.get("doi")), abstract,
+        ]
+        for f in OVERVIEW_FIELDS:
+            row.append(fields.get(f, ""))
+        row[OVERVIEW_FIELDS.index("evidence") + 7] = auto_evidence_snippets(abstract)
+        rows.append(row)
+    with open(args.out, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+    if args.xlsx:
+        write_xlsx(args.xlsx, header, rows)
+    print(f"Auto-extracted {len(rows)} records -> {args.out}")
+    print("Heuristic extraction is a first pass; the agent reviews and refines cells, decisions, and reasons.")
+
+
+def write_xlsx(path, header, rows):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Literature Overview"
+    ws.append(header)
+    for row in rows:
+        ws.append(["" if v is None else v for v in row])
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2F6DB3")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for i, w in enumerate([10, 45, 22, 10, 20, 60] + [18] * len(OVERVIEW_FIELDS), start=1):
+        ws.column_dimensions[get_column_letter(i)].width = min(w, 45)
+    wb.save(path)
+    print(f"Excel written to {path}")
+
+
+def openalex_by_dois(dois):
+    """Fetch OpenAlex records (citation count, OA status, PDF) for a list of DOIs."""
+    dois = sorted({d.strip().lower() for d in dois if d and d.strip()})
+    out = {}
+    for i in range(0, len(dois), 25):
+        chunk = dois[i : i + 25]
+        params = {"filter": "doi:" + "|".join(chunk), "per-page": 25, "mailto": "research@example.com"}
+        url = OPENALEX + "?" + urllib.parse.urlencode(params)
+        data = json.loads(http_get(url))
+        for w in data.get("results", []):
+            doi = (w.get("doi") or "").lower().replace("https://doi.org/", "")
+            if doi:
+                out[doi] = w
+        time.sleep(0.2)
+    return out
+
+
+def openalex_abstract(inverted):
+    if not inverted:
+        return ""
+    pos = {}
+    for word, idxs in inverted.items():
+        for i in idxs:
+            pos[i] = word
+    return " ".join(pos[i] for i in sorted(pos))
+
+
+def norm_openalex(w):
+    src = (w.get("primary_location") or {}).get("source") or {}
+    oa = w.get("open_access") or {}
+    pdf = ((w.get("best_oa_location") or {}).get("pdf_url") or "")
+    status = "open_pdf" if pdf else ("oa_available" if oa.get("oa_status") not in (None, "closed") else "no_open_pdf")
+    return {
+        "id": w.get("id", ""),
+        "source_platform": "openalex",
+        "title": w.get("title", "") or "",
+        "authors": [a.get("author", {}).get("display_name", "") for a in w.get("authorships", [])],
+        "journal": src.get("display_name", "") or "",
+        "pubDate": w.get("publication_date") or str(w.get("publication_year", "") or ""),
+        "doi": (w.get("doi") or "").replace("https://doi.org/", ""),
+        "abstract": openalex_abstract(w.get("abstract_inverted_index")),
+        "citation_count": w.get("cited_by_count"),
+        "oa_status": oa.get("oa_status"),
+        "oa_pdf_url": pdf,
+        "full_text_status": status,
+        "pmid": "",
+    }
+
+
+def openalex_search(query, max_results, date_from, date_to, sort):
+    sort_map = {"citations": "cited_by_count:desc", "date": "publication_date:desc", "relevance": "relevance_score:desc"}
+    params = {
+        "search": query,
+        "per-page": max_results,
+        "sort": sort_map.get(sort, "relevance_score:desc"),
+        "mailto": "research@example.com",
+    }
+    filters = []
+    if date_from:
+        filters.append("from_publication_date:" + date_from.replace("/", "-"))
+    if date_to:
+        filters.append("to_publication_date:" + date_to.replace("/", "-"))
+    if filters:
+        params["filter"] = ",".join(filters)
+    url = OPENALEX + "?" + urllib.parse.urlencode(params)
+    data = json.loads(http_get_retry(url))
+    return [norm_openalex(w) for w in data.get("results", [])]
+
+
+def norm_crossref(m):
+    date_parts = (m.get("published-print") or m.get("published-online") or m.get("published") or {}).get("date-parts", [[None]])
+    full = ""
+    if date_parts and date_parts[0]:
+        full = "-".join(str(x) for x in date_parts[0] if x is not None)
+    authors = []
+    for a in m.get("author", []):
+        nm = " ".join(x for x in [a.get("family", ""), a.get("given", "")] if x)
+        if nm:
+            authors.append(nm)
+    abstract = re.sub(r"<[^>]+>", " ", m.get("abstract", "") or "")
+    return {
+        "id": (m.get("DOI") or "").lower(),
+        "source_platform": "crossref",
+        "title": (m.get("title") or [""])[0],
+        "authors": authors,
+        "journal": (m.get("container-title") or [""])[0],
+        "pubDate": full or str((m.get("issued") or {}).get("date-parts", [[None]])[0][0] or ""),
+        "doi": (m.get("DOI") or "").lower(),
+        "abstract": " ".join(abstract.split()),
+        "citation_count": m.get("is-referenced-by-count"),
+        "oa_status": "",
+        "oa_pdf_url": "",
+        "full_text_status": "",
+        "pmid": "",
+    }
+
+
+def crossref_search(query, max_results, date_from, date_to, sort):
+    sort_map = {"citations": "is-referenced-by-count", "date": "published", "relevance": "relevance"}
+    params = {
+        "query.bibliographic": query,
+        "rows": max_results,
+        "sort": sort_map.get(sort, "relevance"),
+        "mailto": "research@example.com",
+    }
+    filters = []
+    if date_from:
+        filters.append("from-pub-date:" + date_from.replace("/", "-"))
+    if date_to:
+        filters.append("until-pub-date:" + date_to.replace("/", "-"))
+    if filters:
+        params["filter"] = ",".join(filters)
+    url = CROSSREF + "?" + urllib.parse.urlencode(params)
+    data = json.loads(http_get_retry(url))
+    return [norm_crossref(m) for m in data.get("message", {}).get("items", [])]
+
+
+def arxiv_search(query, max_results, date_from, date_to, sort):
+    q = f'all:"{query}"'
+    if date_from or date_to:
+        d1 = (date_from or "00010101").replace("/", "")
+        d2 = (date_to or "99991231").replace("/", "")
+        q += f" AND submittedDate:[{d1} TO {d2}]"
+    params = {
+        "search_query": q,
+        "max_results": max_results,
+        "sortBy": "submittedDate" if sort == "date" else "relevance",
+        "sortOrder": "descending",
+    }
+    url = "https://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
+    print(f"  [arxiv query] {q}")
+    xml_text = http_get_retry(url)
+    root = ET.fromstring(xml_text)
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    recs = []
+    for e in root.findall("a:entry", ns):
+        title = " ".join((e.findtext("a:title", default="", namespaces=ns) or "").split())
+        authors = [a.findtext("a:name", default="", namespaces=ns) for a in e.findall("a:author", ns)]
+        published = (e.findtext("a:published", default="", namespaces=ns) or "")[:10]
+        arxiv_id = (e.findtext("a:id", default="", namespaces=ns) or "").rsplit("/", 1)[-1]
+        doi = ""
+        for link in e.findall("a:link", ns):
+            if link.get("title") == "doi":
+                doi = (link.get("href") or "").replace("https://doi.org/", "")
+        recs.append({
+            "id": "arxiv:" + arxiv_id,
+            "source_platform": "arxiv",
+            "title": title,
+            "authors": authors,
+            "journal": "arXiv",
+            "pubDate": published or str((e.findtext("a:published", default="", namespaces=ns) or "")[:4]),
+            "doi": doi.lower(),
+            "arxiv_id": arxiv_id,
+            "abstract": " ".join((e.findtext("a:summary", default="", namespaces=ns) or "").split()),
+            "citation_count": None,
+            "oa_status": "green",
+            "oa_pdf_url": f"https://arxiv.org/pdf/{arxiv_id}",
+            "full_text_status": "open_pdf",
+            "pmid": "",
+        })
+    return recs
+
+
+def semanticscholar_search(query, max_results, date_from, date_to, sort):
+    params = {
+        "query": query,
+        "limit": max_results,
+        "fields": "title,authors,year,abstract,venue,citationCount,externalIds,openAccessPdf,publicationDate",
+    }
+    url = "https://api.semanticscholar.org/graph/v1/paper/search?" + urllib.parse.urlencode(params)
+    print(f"  [semanticscholar query] {query} (rate-limited without API key)")
+    try:
+        data = json.loads(http_get_retry(url))
+    except Exception as exc:
+        print(f"  semanticscholar unavailable: {exc}")
+        return []
+    recs = []
+    for p in data.get("data", []):
+        ext = p.get("externalIds") or {}
+        pdf = (p.get("openAccessPdf") or {}).get("url") or ""
+        pubdate = p.get("publicationDate") or str(p.get("year") or "")
+        year = str(pubdate)[:4]
+        if date_from and year and year < date_from[:4]:
+            continue
+        if date_to and year and year > date_to[:4]:
+            continue
+        recs.append({
+            "id": "s2:" + (ext.get("CorpusId") or p.get("paperId", "")),
+            "source_platform": "semanticscholar",
+            "title": p.get("title", ""),
+            "authors": [a.get("name", "") for a in p.get("authors", [])],
+            "journal": p.get("venue", ""),
+            "pubDate": pubdate,
+            "doi": (ext.get("DOI") or "").lower(),
+            "arxiv_id": ext.get("ArXiv", ""),
+            "pmid": str(ext.get("PubMed") or ""),
+            "abstract": p.get("abstract", "") or "",
+            "citation_count": p.get("citationCount"),
+            "oa_status": "open_pdf" if pdf else "",
+            "oa_pdf_url": pdf,
+            "full_text_status": "open_pdf" if pdf else "no_open_pdf",
+        })
+    return recs
+
+
+def europepmc_search(query, max_results, date_from, date_to, sort):
+    q = query
+    if date_from or date_to:
+        q += f" AND PUB_YEAR:[{(date_from or '0001')[:4]} TO {(date_to or '9999')[:4]}]"
+    params = {"query": q, "format": "json", "pageSize": max_results, "resultType": "core"}
+    url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search?" + urllib.parse.urlencode(params)
+    print(f"  [europepmc query] {q}")
+    data = json.loads(http_get_retry(url))
+    recs = []
+    for r in data.get("resultList", {}).get("result", []):
+        pdf = ""
+        for u in r.get("fullTextUrlList", {}).get("fullTextUrl", []):
+            if u.get("documentStyle") == "pdf" and "Open access" in u.get("availability", ""):
+                pdf = u.get("url", "")
+                break
+        recs.append({
+            "id": "pmc:" + (r.get("pmcid") or r.get("pmid") or ""),
+            "source_platform": "europepmc",
+            "title": r.get("title", ""),
+            "authors": [a.strip() for a in (r.get("authorString") or "").split(",") if a.strip()],
+            "journal": r.get("journalTitle", ""),
+            "pubDate": str(r.get("pubYear", "")),
+            "doi": (r.get("doi") or "").lower(),
+            "pmid": str(r.get("pmid") or ""),
+            "pmcid": r.get("pmcid", ""),
+            "abstract": r.get("abstractText", "") or "",
+            "citation_count": None,
+            "oa_status": "open_pdf" if pdf else ("oa_available" if r.get("isOpenAccess") == "Y" else ""),
+            "oa_pdf_url": pdf,
+            "full_text_status": "open_pdf" if pdf else ("oa_available" if r.get("isOpenAccess") == "Y" else "no_open_pdf"),
+        })
+    return recs
+
+
+def doaj_search(query, max_results, date_from, date_to, sort):
+    q = query
+    url = "https://doaj.org/api/search/articles/" + urllib.parse.quote(q) + f"?pageSize={max_results}"
+    print(f"  [doaj query] {q}")
+    data = json.loads(http_get_retry(url))
+    recs = []
+    for r in data.get("results", []):
+        b = r.get("bibjson", {})
+        year = str(b.get("year", ""))
+        if date_from and year and year < date_from[:4]:
+            continue
+        if date_to and year and year > date_to[:4]:
+            continue
+        link = ""
+        if b.get("link"):
+            link = b["link"][0].get("url", "")
+        recs.append({
+            "id": "doaj:" + r.get("id", ""),
+            "source_platform": "doaj",
+            "title": b.get("title", ""),
+            "authors": [a.get("name", "") for a in b.get("author", [])],
+            "journal": (b.get("journal") or {}).get("title", ""),
+            "pubDate": year,
+            "doi": (b.get("doi") or "").lower(),
+            "abstract": b.get("abstract", "") or "",
+            "citation_count": None,
+            "oa_status": "oa_available",
+            "oa_pdf_url": link,
+            "full_text_status": "oa_available",
+            "pmid": "",
+        })
+    return recs
+
+
+def hal_search(query, max_results, date_from, date_to, sort):
+    params = {
+        "q": query,
+        "rows": max_results,
+        "fl": "title_s,authFullName_s,doiId_s,journalTitle_s,abstract_s,producedDate_s,fileMain_s",
+    }
+    if date_from or date_to:
+        params["fq"] = f"producedDate_s:[{(date_from or '1900-01-01').replace('/', '-')} TO {(date_to or '9999-12-31').replace('/', '-')}]"
+    url = "https://api.archives-ouvertes.fr/search/?" + urllib.parse.urlencode(params)
+    print(f"  [hal query] {query}")
+    data = json.loads(http_get_retry(url))
+    recs = []
+    for d in data.get("response", {}).get("docs", []):
+        recs.append({
+            "id": "hal:" + (d.get("halId_s") or d.get("docid", "")),
+            "source_platform": "hal",
+            "title": first_str(d.get("title_s")),
+            "authors": d.get("authFullName_s", []),
+            "journal": first_str(d.get("journalTitle_s")),
+            "pubDate": (d.get("producedDate_s") or "")[:10],
+            "doi": first_str(d.get("doiId_s")).lower(),
+            "abstract": first_str(d.get("abstract_s")),
+            "citation_count": None,
+            "oa_status": "green",
+            "oa_pdf_url": first_str(d.get("fileMain_s")),
+            "full_text_status": "open_pdf" if first_str(d.get("fileMain_s")) else "no_open_pdf",
+            "pmid": "",
+        })
+    return recs
+
+
+def cmd_enrich(args):
+    """Enrich PubMed records with OpenAlex citation counts, OA status, and PDF links."""
+    records = load_records(args.input)
+    dois = [r.get("doi") for r in records]
+    oa = openalex_by_dois(dois)
+    n_hit = 0
+    for r in records:
+        doi = (r.get("doi") or "").strip().lower()
+        w = oa.get(doi)
+        if not w:
+            continue
+        n_hit += 1
+        r["citation_count"] = w.get("cited_by_count")
+        r["oa_status"] = (w.get("open_access") or {}).get("oa_status")
+        r["oa_pdf_url"] = ((w.get("best_oa_location") or {}).get("pdf_url") or "")
+        r["openalex_title"] = w.get("title")
+    save_records(records, args.out)
+    print(f"Enriched {n_hit}/{len(records)} records via OpenAlex -> {args.out}")
+    for r in records:
+        print(f"  [{r['pmid']}] citations={r.get('citation_count', '-')} OA={r.get('oa_status', '-')} {(r.get('title') or '')[:70]}")
+
+
+def cmd_search_multi(args):
+    """Search PubMed/OpenAlex/Crossref for one query, merge by DOI/title, deduplicate."""
+    sources = [s.strip().lower() for s in args.sources.split(",") if s.strip()]
+    if not sources:
+        sys.exit("No sources given (use --sources pubmed,openalex,crossref).")
+    merged = {}
+    for src in sources:
+        if src == "pubmed":
+            recs = run_pubmed_search(args.query, args.max)
+            for r in recs:
+                r["source_platform"] = "pubmed"
+        elif src == "openalex":
+            recs = openalex_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        elif src == "crossref":
+            recs = crossref_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        elif src == "arxiv":
+            recs = arxiv_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        elif src == "semanticscholar":
+            recs = semanticscholar_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        elif src == "europepmc":
+            recs = europepmc_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        elif src == "doaj":
+            recs = doaj_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        elif src == "hal":
+            recs = hal_search(args.query, args.max, args.date_from, args.date_to, args.sort)
+        else:
+            print(f"  unknown source {src!r}, skipped")
+            continue
+        print(f"  {src}: {len(recs)} records")
+        for r in recs:
+            r["query"] = args.query
+            key = (r.get("doi") or "").lower() or r.get("id") or r.get("pmid") or (r.get("title") or "").lower()
+            merged.setdefault(key, r)
+    records = list(merged.values())
+    if args.sort == "citations":
+        records.sort(key=lambda r: (r.get("citation_count") if isinstance(r.get("citation_count"), int) else -1), reverse=True)
+    elif args.sort == "date":
+        records.sort(key=lambda r: r.get("pubDate", ""), reverse=True)
+    save_records(records, args.out)
+    print(f"Merged {len(sources)} sources -> {len(records)} unique records saved to {args.out}")
+
+
+def cmd_lite(args):
+    """Two-pass strategy, pass 1: compact scan table before deep extraction."""
+    records = load_records(args.input)
+    print("| 来源 | 标识 | 年份 | 期刊 | 引用数 | OA | 标题 |")
+    print("|---|---|---|---|---|---|---|")
+    for r in records:
+        source = first_str(r.get("source_platform")) or "pubmed"
+        ident = first_str(r.get("pmid")) or first_str(r.get("doi")) or first_str(r.get("id")) or "-"
+        title = first_str(r.get("title")).replace("|", "/")
+        if len(title) > 70:
+            title = title[:69] + "..."
+        print(f"| {source} | {ident} | {first_str(r.get('pubDate'))[:4]} | {first_str(r.get('journal'))[:22]} | {r.get('citation_count', '-')} | {first_str(r.get('oa_status')) or first_str(r.get('full_text_status')) or '-'} | {title} |")
+    print(f"\n共 {len(records)} 条;确认核心文献后,用 overview 做第二遍深提取。")
+
+
+def fmt_bibtex_author(name):
+    # Keep PubMed's "Last FM" format as-is: compound surnames and suffixes
+    # (e.g., "Shahrokh Esfahani M", "Loo BW Jr") cannot be split reliably.
+    return (name or "").strip()
+
+
+def bibtex_entry(r, key):
+    authors = " and ".join(fmt_bibtex_author(a) for a in (r.get("authors") or []))
+    fields = [
+        ("author", authors),
+        ("title", r.get("title", "")),
+        ("journal", r.get("journal", "")),
+        ("year", (r.get("pubDate") or "")[:4]),
+        ("volume", r.get("volume", "")),
+        ("number", r.get("issue", "")),
+        ("pages", r.get("pages", "")),
+        ("doi", r.get("doi", "")),
+        ("pmid", r.get("pmid", "")),
+    ]
+    lines = [f"@article{{{key},"]
+    for name, val in fields:
+        if val:
+            esc = str(val).replace("&", "\\&").replace("%", "\\%").replace("#", "\\#")
+            lines.append(f"  {name} = {{{esc}}},")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def cmd_export(args):
+    records = load_records(args.input)
+    lines = []
+    for r in records:
+        last = ((r.get("authors") or [""])[0].split()[0] if (r.get("authors")) else "unknown").lower()
+        key = f"{last}{(r.get('pubDate') or '')[:4]}{r.get('pmid', '')}"
+        if args.format == "bib":
+            lines.append(bibtex_entry(r, key))
+        else:
+            lines.append("TY  - JOUR")
+            for a in r.get("authors") or []:
+                lines.append(f"AU  - {a}")
+            lines.append(f"TI  - {r.get('title', '')}")
+            lines.append(f"JO  - {r.get('journal', '')}")
+            lines.append(f"PY  - {(r.get('pubDate') or '')[:4]}")
+            if r.get("volume"):
+                lines.append(f"VL  - {r['volume']}")
+            if r.get("issue"):
+                lines.append(f"IS  - {r['issue']}")
+            if r.get("pages"):
+                lines.append(f"SP  - {r['pages'].split('-')[0]}")
+                if "-" in r.get("pages", ""):
+                    lines.append(f"EP  - {r['pages'].split('-', 1)[1]}")
+            if r.get("doi"):
+                lines.append(f"DO  - {r['doi']}")
+            if r.get("pmid"):
+                lines.append(f"PMID- {r['pmid']}")
+            lines.append("ER  -")
+    text = "\n\n".join(lines)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        print(f"Exported {len(records)} references to {args.out}")
+    else:
+        print(text)
 
 
 def cmd_screen(args):
@@ -361,6 +1218,7 @@ def main():
     p_overview = sub.add_parser("overview", help="Build the standard literature-overview table")
     p_overview.add_argument("--in", dest="input", required=True)
     p_overview.add_argument("--out", required=True)
+    p_overview.add_argument("--xlsx", help="also write a formatted Excel file")
     p_overview.set_defaults(func=cmd_overview)
 
     p_strategy = sub.add_parser("strategy", help="Build PubMed-syntax query variants from topic concepts")
@@ -378,6 +1236,46 @@ def main():
     p_author.add_argument("--max", type=int, default=10)
     p_author.add_argument("--out", help="save records as JSON for the overview pipeline")
     p_author.set_defaults(func=cmd_author_search)
+
+    p_enrich = sub.add_parser("enrich", help="Add OpenAlex citation counts, OA status, and PDF links")
+    p_enrich.add_argument("--in", dest="input", required=True)
+    p_enrich.add_argument("--out", required=True)
+    p_enrich.set_defaults(func=cmd_enrich)
+
+    p_export = sub.add_parser("export", help="Export records as BibTeX or RIS")
+    p_export.add_argument("--in", dest="input", required=True)
+    p_export.add_argument("--format", choices=["bib", "ris"], default="bib")
+    p_export.add_argument("--out", help="output file (default: print to stdout)")
+    p_export.set_defaults(func=cmd_export)
+
+    p_multi = sub.add_parser("search-multi", help="Search PubMed/OpenAlex/Crossref and merge by DOI")
+    p_multi.add_argument("--query", required=True)
+    p_multi.add_argument("--sources", default="pubmed,openalex,crossref")
+    p_multi.add_argument("--max", type=int, default=10)
+    p_multi.add_argument("--from", dest="date_from", help="start date YYYY/MM/DD")
+    p_multi.add_argument("--to", dest="date_to", help="end date YYYY/MM/DD")
+    p_multi.add_argument("--sort", choices=["relevance", "citations", "date"], default="relevance")
+    p_multi.add_argument("--out", required=True)
+    p_multi.set_defaults(func=cmd_search_multi)
+
+    p_lite = sub.add_parser("lite", help="Two-pass pass 1: compact scan table")
+    p_lite.add_argument("--in", dest="input", required=True)
+    p_lite.set_defaults(func=cmd_lite)
+
+    p_pdf = sub.add_parser("download-pdf", help="Batch-download legal open-access PDFs")
+    p_pdf.add_argument("--in", dest="input", required=True)
+    p_pdf.add_argument("--dir", required=True, help="output directory for PDFs + manifest")
+    p_pdf.add_argument("--timeout", type=int, default=60)
+    p_pdf.set_defaults(func=cmd_download_pdf)
+
+    p_extract = sub.add_parser("extract", help="One-shot auto-extraction of overview fields from abstracts")
+    p_extract.add_argument("--in", dest="input", required=True)
+    p_extract.add_argument("--out", required=True)
+    p_extract.add_argument("--xlsx", help="also write a formatted Excel file")
+    p_extract.add_argument("--topic", help="research topic for relevance scoring (default: query stored in results)")
+    p_extract.add_argument("--include", help="pipe-separated required keywords, e.g. 'external validation|prospective'")
+    p_extract.add_argument("--exclude", help="pipe-separated exclusion keywords, e.g. 'review|animal|editorial'")
+    p_extract.set_defaults(func=cmd_extract)
 
     p_screen = sub.add_parser("screen", help="Deterministic keyword triage (first pass only)")
     p_screen.add_argument("--in", dest="input", required=True)
