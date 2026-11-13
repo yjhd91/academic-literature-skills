@@ -1,0 +1,43 @@
+[
+  {
+    "pmid": "40181378",
+    "doi": "10.1186/s12967-024-06057-y",
+    "title": "Habitat radiomics analysis for progression free survival in non-small cell lung cancer",
+    "journal": "J Transl Med",
+    "pubDate": "2025 Apr 3",
+    "abstract": "BACKGROUND: Non-small cell lung cancer is heterogeneous. METHODS: We retrospectively enrolled 240 patients and performed external validation. RESULTS: AUC 0.82. LIMITATIONS: single centre.",
+    "source_platform": "pubmed"
+  },
+  {
+    "doi": "10.1186/s12967-024-06057-y",
+    "title": "Habitat radiomics analysis for progression free survival in non-small cell lung cancer",
+    "journal": "Journal of Translational Medicine",
+    "pubDate": "2025",
+    "citation_count": 12,
+    "oa_status": "gold",
+    "source_platform": "openalex"
+  },
+  {
+    "pmid": "39223336",
+    "doi": "10.1007/s00330-024-11036-4",
+    "title": "Diagnostic accuracy of CT and PET/CT radiomics in predicting lymph node metastasis",
+    "journal": "Eur Radiol",
+    "pubDate": "2024",
+    "abstract": "This retrospective cohort study included 512 patients with internal validation only.",
+    "source_platform": "pubmed"
+  },
+  {
+    "title": "肺结节放射组学模型的建立与外部验证",
+    "journal": "中华放射学杂志",
+    "pubDate": "2024",
+    "abstract": "目的：建立肺结节放射组学模型。方法：回顾性纳入112例患者，并进行外部验证。结果：AUC为0.87。",
+    "source_platform": "cnki"
+  },
+  {
+    "title": "肺结节放射组学模型的建立与外部验证",
+    "journal": "中华放射学杂志",
+    "pubDate": "2024",
+    "abstract": "目的：建立肺结节放射组学模型。方法：回顾性纳入112例患者，并进行外部验证。",
+    "source_platform": "wanfang"
+  }
+]

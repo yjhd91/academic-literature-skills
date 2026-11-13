@@ -104,7 +104,12 @@ def esummary(pmids):
     out = {}
     for pid in pmids:
         item = result.get(pid)
-        if not item:
+        # NCBI returns {"uid": "...", "error": "cannot get document summary"} for
+        # an unknown PMID. That must NOT become a record: a blank record would
+        # flow into the CSV and look like a real paper with no title.
+        if not item or "error" in item:
+            continue
+        if not (item.get("title") or "").strip():
             continue
         doi = ""
         pmcid = ""
@@ -207,11 +212,20 @@ def cmd_fetch(args):
     _pace()
     abstracts = efetch_abstracts(pmids)
     results = []
+    missing = []
     for pid in pmids:
         if pid not in meta:
+            missing.append(pid)
             continue
         meta[pid]["abstract"] = abstracts.get(pid, "")
         results.append(meta[pid])
+    if missing:
+        # Never emit a placeholder for an unknown PMID: the caller must know the
+        # identifier is bad rather than receive an empty record it might cite.
+        print("Unknown PMID(s), no record returned: " + ", ".join(missing), file=sys.stderr)
+    if not results:
+        print("Error: none of the requested PMIDs exist in PubMed.", file=sys.stderr)
+        sys.exit(1)
     emit(results, args.format)
 
 

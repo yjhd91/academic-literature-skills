@@ -196,9 +196,12 @@ const ENGINES = {
       const q = ${JSON.stringify("__QUERY__")};
       const limit = ${max};
       const pageSize = 50;
+      const pageCap = Math.min(200, Math.ceil(limit / pageSize) + 1);
       const out = [];
       let total = '';
-      for (let page = 1; out.length < limit && page <= 200; page++) {
+      for (let page = 1; out.length < limit && page <= pageCap; page++) {
+        // Be a polite client: one request per page with a gap, capped by --max.
+        if (page > 1) await new Promise(r => setTimeout(r, 900));
         const r = await fetch('/apiVue/search/searchList', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -307,12 +310,21 @@ async function openTarget(port) {
 }
 
 async function run() {
+  if (opt("list", "") === "1") {
+    // Machine-readable engine list, used by lit_doctor and by the CLI help.
+    console.log(JSON.stringify({ engines: Object.keys(ENGINES) }, null, 2));
+    process.exit(0);
+  }
+  const cfg = ENGINES[engine];
+  if (!cfg) {
+    // Never fall back to Bing: a typo would silently return the wrong database.
+    console.error(JSON.stringify({ error: "unknown engine: " + engine, engines: Object.keys(ENGINES) }));
+    process.exit(2);
+  }
   if (opt("print-url", "") === "1") {
-    const cfg = ENGINES[engine] || ENGINES.bing;
     console.log(cfg.url(query));
     process.exit(0);
   }
-  const cfg = ENGINES[engine] || ENGINES.bing;
   if (!query) {
     console.error(JSON.stringify({ error: "missing --query" }));
     process.exit(1);
@@ -359,12 +371,14 @@ async function run() {
   }
   const probeExpr = typeof cfg.probe === "function" ? cfg.probe() : cfg.probe;
   const start = Date.now();
+  let probeHit = false;
   while (Date.now() - start < cfg.waitMs) {
     const probeRes = await send("Runtime.evaluate", {
       expression: probeExpr,
       returnByValue: true,
     });
     if (probeRes.result && probeRes.result.result && probeRes.result.result.value === true) {
+      probeHit = true;
       await new Promise((r) => setTimeout(r, 800));
       break;
     }
@@ -376,6 +390,35 @@ async function run() {
       returnByValue: true,
     });
     console.error("[debug] " + (dbg.result && dbg.result.result && dbg.result.result.value));
+  }
+  // A timeout is not the same as "zero results". Detect the login/CAPTCHA wall
+  // explicitly so the caller can tell the user to log in instead of silently
+  // reporting that this database has no relevant literature.
+  if (!probeHit) {
+    const wall = await send("Runtime.evaluate", {
+      expression: `(() => {
+        const t = document.body ? document.body.innerText : '';
+        const u = location.href;
+        const marks = ['登录', '登入', 'Sign in', 'Log in', '验证码', 'captcha', '安全验证', '请完成验证',
+                       'Access Denied', 'Forbidden', '人机验证', 'start_session'];
+        const hit = marks.filter(m => t.includes(m) || u.includes(m));
+        return JSON.stringify({ hit, url: u, excerpt: t.slice(0, 300) });
+      })()`,
+      returnByValue: true,
+    });
+    const raw = (wall.result && wall.result.result && wall.result.result.value) || "{}";
+    let info = {};
+    try { info = JSON.parse(raw); } catch { /* ignore */ }
+    if (info.hit && info.hit.length) {
+      console.log(JSON.stringify({
+        engine, query, error: "login_or_captcha_required",
+        detail: "page shows: " + info.hit.join(", "),
+        url: info.url, excerpt: info.excerpt, needsLogin: cfg.needsLogin,
+        results: [],
+      }, null, 2));
+      ws.close();
+      return;
+    }
   }
   let items = [];
   let total = "";

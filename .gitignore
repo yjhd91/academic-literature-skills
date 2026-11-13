@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+
+# Tool output: search/screening artefacts must never be committed.
+# If you need to keep one as evidence, put it under evals/fixtures/ deliberately.
+*.xlsx
+*.bib
+*.ris
+pdfs/
+results*.json
+merged*.json
+dedupe.json
+strategy.json
+browser_results.json
+verify*.csv
+verify*.md
+verify*.json
+prisma*.json
+prisma*.md
+overview*.csv
+triage*.csv
+*template.csv
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp

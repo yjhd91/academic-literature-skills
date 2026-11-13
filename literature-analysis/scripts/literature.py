@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
-"""Literature analysis pipeline: fetch PubMed records and build extraction/screening files.
+"""Literature analysis pipeline: search, dedupe, verify, extract, screen, report.
 
-The semantic extraction and screening are performed by the agent following SKILL.md.
-This script handles data plumbing (fetch + save) and deterministic keyword triage.
+The semantic extraction and screening are performed by the agent following
+SKILL.md. This script handles data plumbing and deterministic checks, so the
+agent never has to retype a count or trust an unverified citation.
 
-Commands:
-  fetch --query "QUERY" [--max N] --out results.json
-  template --in results.json --out template.csv [--fields "study design,sample size,..."]
-  screen --in results.json --out triage.csv [--include "kw1|kw2"] [--exclude "kw1|kw2"]
+Commands (see references/commands.md for the full reference):
+  fetch            PubMed search -> results.json
+  search-all       several query variants -> merged records
+  search-multi     several APIs -> merged, deduplicated records
+  dedupe           merge/dedupe existing record files with an audit report
+  verify           cross-check references against Crossref/PubMed/OpenAlex
+  prisma           recompute PRISMA 2020 flow counts from records + decisions
+  strategy         build native queries per platform (+ MeSH)
+  translate        convert a query into each platform's syntax
+  extract          one-shot heuristic field extraction
+  screen           deterministic keyword triage (first pass only)
+  overview/lite    scan tables
+  enrich/export    citations, OA links, BibTeX/RIS
+  download-pdf     legal open-access PDF download with a manifest
+  browser-search   no-API platforms via Chrome CDP
+  doctor           environment self-check
 
 Examples:
-  python literature.py fetch --query "radiomics lung cancer prognosis" --max 10 --out results.json
-  python literature.py template --in results.json --out template.csv
-  python literature.py screen --in results.json --out triage.csv --include "external validation" --exclude "review|animal"
+  python literature.py doctor
+  python literature.py search-multi --query "radiomics lung cancer" --out results.json
+  python literature.py verify --in results.json --md verify.md --strict
 """
 
 import argparse
@@ -29,12 +42,21 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SKILLS_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PUBMED_SCRIPT = os.path.join(SKILLS_ROOT, "pubmed-live", "scripts", "pubmed.py")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:  # allow `python path/to/literature.py` from anywhere
+    sys.path.insert(0, SCRIPT_DIR)
+
+import lit_common
+import lit_doctor
+import lit_prisma
+import lit_pubmed
+import lit_verify
+
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 OPENALEX = "https://api.openalex.org/works"
 CROSSREF = "https://api.crossref.org/works"
 TOOL = "codex-literature-analysis"
+VERSION = lit_common.__version__
 
 DEFAULT_FIELDS = [
     "study design",
@@ -69,34 +91,31 @@ AUTO_FILL = {"citation count": "citation_count", "open access status": "oa_statu
 
 
 def http_get(url, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": TOOL})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+    """GET through lit_common: shared User-Agent, polite mailto, bounded retry."""
+    return lit_common.http_get(lit_common.with_mailto(url), timeout=timeout, retries=1)
 
 
 def http_get_retry(url, tries=3, timeout=30):
-    """GET with polite backoff for 429/timeout (failure-signal handling)."""
-    last = None
-    for i in range(tries):
-        try:
-            return http_get(url, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            last = exc
-            if exc.code == 429:
-                time.sleep(2 * (i + 1))
-                continue
-            raise
-        except Exception as exc:  # timeout / connection error
-            last = exc
-            time.sleep(2 * (i + 1))
-    raise last
+    """GET with the bounded 429/5xx retry budget defined in lit_common."""
+    return lit_common.http_get(lit_common.with_mailto(url), timeout=timeout, retries=tries)
 
 
 def first_str(v):
-    """Return the first element of a list value, or the scalar; empty string if None."""
-    if isinstance(v, list):
-        return v[0] if v else ""
-    return v or ""
+    """First element of a list, or the scalar; "" for None and empty containers.
+
+    Numbers are preserved as strings so a citation count of 0 is written as "0"
+    instead of disappearing from the table.
+    """
+    if isinstance(v, (list, tuple)):
+        if not v:
+            return ""
+        v = v[0]
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return str(v)
+    return str(v)
+
 
 
 def mesh_lookup(concept, max_mesh=3):
@@ -247,11 +266,11 @@ def platform_count(platform, query, date_from, date_to):
     return "0"
 
 
-def build_strategy(concepts, sources, date_from, date_to):
+def build_strategy(concepts, sources, date_from, date_to, mesh_limit=3):
     mesh = {}
     if "pubmed" in sources:
         for c in concepts:
-            mesh[c] = mesh_lookup(c, 3)
+            mesh[c] = mesh_lookup(c, mesh_limit)
             time.sleep(0.4)
     queries = {}
     for s in sources:
@@ -266,56 +285,44 @@ def build_strategy(concepts, sources, date_from, date_to):
 
 
 def load_records(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Read records from JSON list / JSON object / JSON Lines (see lit_common)."""
+    return lit_common.load_records(path)
 
 
 def save_records(records, path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False, indent=2)
+    return lit_common.save_records(records, path)
 
 
 def cmd_fetch(args):
-    if not os.path.isfile(PUBMED_SCRIPT):
-        sys.exit(f"pubmed-live script not found at {PUBMED_SCRIPT}")
-    proc = subprocess.run(
-        [sys.executable, PUBMED_SCRIPT, "search", args.query, "--max", str(args.max), "--format", "json"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        sys.exit(f"pubmed-live search failed: {proc.stderr.strip()}")
-    records = json.loads(proc.stdout)
+    records = run_pubmed_search(args.query, args.max)
     save_records(records, args.out)
     print(f"Saved {len(records)} records to {args.out}")
 
 
-def run_pubmed_search(query, max_results):
+def run_pubmed_search(query, max_results, sort="relevance"):
+    """Search PubMed through the in-skill client (no sibling-skill dependency)."""
     last = None
     for attempt in range(3):
-        proc = subprocess.run(
-            [sys.executable, PUBMED_SCRIPT, "search", query, "--max", str(max_results), "--format", "json"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-        if proc.returncode == 0:
-            return json.loads(proc.stdout)
-        last = RuntimeError(f"pubmed-live search failed for {query!r}: {proc.stderr.strip()}")
-        time.sleep(2 * (attempt + 1))
-    raise last
+        try:
+            return lit_pubmed.search(query, max_results, sort=sort)
+        except Exception as exc:
+            last = exc
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"PubMed search failed for {query!r}: {last}")
+
 
 
 def cmd_search_all(args):
     """Run several query variants for one topic, merge by PMID, and deduplicate."""
+    if not args.queries and not args.queries_file:
+        sys.exit("No queries provided: use --queries 'a|b|c' or --queries-file path.")
     if args.queries_file:
         with open(args.queries_file, "r", encoding="utf-8") as f:
             queries = [line.strip() for line in f if line.strip()]
     else:
         queries = [q.strip() for q in args.queries.split("|") if q.strip()]
     if not queries:
-        sys.exit("No queries provided (use --queries 'a|b|c' or --queries-file).")
+        sys.exit("No usable queries found in --queries / --queries-file.")
     merged = {}
     for q in queries:
         recs = run_pubmed_search(q, args.max)
@@ -323,7 +330,11 @@ def cmd_search_all(args):
         for r in recs:
             r["query"] = q
             r["source_platform"] = "pubmed"
-            merged[r["pmid"]] = r
+            key = lit_common.record_key(r) or ("pmid:" + first_str(r.get("pmid")))
+            if key in merged:
+                lit_common.merge_records(merged[key], r)
+            else:
+                merged[key] = r
     records = list(merged.values())
     save_records(records, args.out)
     print(f"Merged {len(queries)} queries -> {len(records)} unique records saved to {args.out}")
@@ -402,17 +413,8 @@ def cmd_author_search(args):
     issues = validate_query(query)
     if issues:
         print("Query warnings:", "; ".join(issues))
-    time.sleep(0.4)
     total = search_count(query)
-    proc = subprocess.run(
-        [sys.executable, PUBMED_SCRIPT, "search", query, "--max", str(args.max), "--sort", "pub_date", "--format", "json"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        sys.exit(f"pubmed-live search failed: {proc.stderr.strip()}")
-    records = json.loads(proc.stdout)
+    records = run_pubmed_search(query, args.max, sort="pub_date")
     if args.out:
         save_records(records, args.out)
     print(f"Author query: {query}")
@@ -556,6 +558,16 @@ POP_TERMS = ["non-small cell lung cancer", "nsclc", "small cell lung cancer", "s
 
 def extract_study_design(text):
     t = text.lower()
+    design = _design_en(t)
+    if design == "Not stated":
+        design = _design_zh(text) or "Not stated"
+    is_multi = any(k in t for k in ["multi-center", "multicenter", "multi-centre", "multicentre", "multi-institutional", "multi institutional", "from three sites", "four academic medical centers", "多中心"])
+    if is_multi:
+        design = design + " (multi-center)" if design != "Not stated" else "Multi-center study"
+    return design
+
+
+def _design_en(t):
     if "systematic review" in t or "meta-analysis" in t or "meta analysis" in t:
         return "Systematic review / meta-analysis"
     if (re.search(r"randomi[sz]ed\s+(?:open-label\s+)?controlled", t) or "randomized clinical trial" in t
@@ -585,10 +597,35 @@ def extract_study_design(text):
         design = "Proof of concept"
     else:
         design = "Not stated"
-    is_multi = any(k in t for k in ["multi-center", "multicenter", "multi-centre", "multicentre", "multi-institutional", "multi institutional", "from three sites", "four academic medical centers"])
-    if is_multi:
-        design = design + " (multi-center)" if design != "Not stated" else "Multi-center study"
     return design
+
+
+#: Chinese/Japanese design markers. Chinese databases return Chinese abstracts, and
+#: the English keyword rules silently produce "Not stated" for all of them.
+DESIGN_ZH = [
+    ("系统评价", "Systematic review / meta-analysis"),
+    ("系统综述", "Systematic review / meta-analysis"),
+    ("荟萃分析", "Systematic review / meta-analysis"),
+    ("Meta分析", "Systematic review / meta-analysis"),
+    ("随机对照", "Randomized controlled trial"),
+    ("随机分组", "Randomized controlled trial"),
+    ("前瞻性", "Prospective cohort study"),
+    ("回顾性", "Retrospective cohort study"),
+    ("队列", "Cohort study"),
+    ("横断面", "Cross-sectional study"),
+    ("病例对照", "Case-control study"),
+    ("病例系列", "Case series"),
+    ("个案报道", "Case report"),
+    ("病例报告", "Case report"),
+    ("综述", "Narrative review"),
+]
+
+
+def _design_zh(text):
+    for keyword, label in DESIGN_ZH:
+        if keyword in text:
+            return label
+    return ""
 
 
 def extract_sample_size(text):
@@ -598,11 +635,15 @@ def extract_sample_size(text):
                 r"cohort of\s*([\d,]+)",
                 r"n\s*=\s*([\d,]+)",
                 r"N\s*=\s*([\d,]+)",
-                r"included\s*([\d,]+)"]:
+                r"included\s*([\d,]+)",
+                r"(?:enrolled|recruited|analy[sz]ed|studied|involved)\s+([\d,]+)\s*(?:patients?|participants?|subjects?|cases?)",
+                # Chinese / Japanese: "共纳入 418 例患者", "112例", "85 名受试者"
+                r"(?:共|纳入|收集|选取)?\s*([\d,]+)\s*(?:例|名)\s*(?:患者|病人|病例|受试者|研究对象|儿童|成人)?"]:
         m = re.search(pat, text, re.I)
         if m:
             return m.group(1).replace(",", "")
     return "Not stated"
+
 
 
 def extract_modality(text):
@@ -629,10 +670,15 @@ def extract_population(text):
 def extract_validation(text):
     t = text.lower()
     has_ext = ("external validation" in t or "externally validated" in t or "external test" in t
-               or ("external" in t and ("validat" in t or "testing set" in t)))
-    has_int = "internal validation" in t or "internally validated" in t or ("internal" in t and "validat" in t)
-    has_ind = "independent validation" in t or "independent test" in t or "independent external" in t or "two independent validation" in t
-    has_test = "test set" in t or "testing set" in t or "test dataset" in t or "held-out" in t or "validation set" in t or "validation cohort" in t
+               or ("external" in t and ("validat" in t or "testing set" in t))
+               or "外部验证" in text or "外部队列" in text or "外部测试集" in text)
+    has_int = ("internal validation" in t or "internally validated" in t or ("internal" in t and "validat" in t)
+               or "内部验证" in text or "交叉验证" in text)
+    has_ind = ("independent validation" in t or "independent test" in t or "independent external" in t
+               or "two independent validation" in t or "独立验证" in text or "独立队列" in text)
+    has_test = ("test set" in t or "testing set" in t or "test dataset" in t or "held-out" in t
+                or "validation set" in t or "validation cohort" in t
+                or "验证集" in text or "测试集" in text or "验证队列" in text)
     if has_ext and (has_int or has_ind or has_test):
         return "Internal + external validation"
     if has_ext:
@@ -643,7 +689,7 @@ def extract_validation(text):
         return "Internal validation"
     if has_test:
         return "Validation split (unspecified)"
-    if "validation" in t:
+    if "validation" in t or "验证" in text:
         return "Validation (unspecified)"
     return "Not stated"
 
@@ -684,6 +730,10 @@ def extract_findings(text):
 
 def extract_limitations(text):
     m = re.search(r"[^.!?]*?(?:limitation|limited by|retrospective design|small sample|proof-of-concept|proof of concept)[^.!?]*", text, re.I)
+    if m:
+        return " ".join(m.group(0).split())[:200]
+    # Chinese abstracts list limitations as "局限" / "不足之处" / "受限于".
+    m = re.search(r"[^。；]*?(?:局限|不足之处|受限于)[^。；]*", text)
     if m:
         return " ".join(m.group(0).split())[:200]
     return "Not stated"
@@ -761,29 +811,67 @@ def cmd_translate_query(args):
     print(f"{args.text} -> {result}")
 
 
+def find_node():
+    """Locate Node without hardcoding one machine's install path.
+
+    Order: PATH -> NODE env var -> the usual per-OS install locations. Node 22+
+    is required because browser_search.mjs uses the built-in fetch/WebSocket.
+    """
+    candidates = []
+    on_path = shutil.which("node")
+    if on_path:
+        candidates.append(on_path)
+    if os.environ.get("NODE"):
+        candidates.append(os.environ["NODE"])
+    if os.name == "nt":
+        for root in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                     os.environ.get("LOCALAPPDATA")):
+            if root:
+                candidates.append(os.path.join(root, "nodejs", "node.exe"))
+                candidates.append(os.path.join(root, "Programs", "nodejs", "node.exe"))
+    else:
+        candidates += ["/usr/local/bin/node", "/usr/bin/node", "/opt/homebrew/bin/node"]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
 def cmd_browser_search(args):
     """Unified browser-assisted search for platforms without public APIs."""
     mjs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_search.mjs")
-    node = shutil.which("node") or r"D:\Program Files\nodejs\node.exe"
-    if not os.path.isfile(node):
-        sys.exit("Node.js not found; browser search requires Node 22+.")
+    node = find_node()
+    if not node:
+        sys.exit("Node.js not found (install Node 22+, or set the NODE environment variable).")
     query = args.query
     if not args.no_translate and args.engine in ENGINE_LANGS:
         translated = translate_text(query, ENGINE_LANGS[args.engine])
         if translated != query:
             print(f"[translate] {args.engine} uses {ENGINE_LANGS[args.engine]}: {query} -> {translated}")
             query = translated
+    child_env = dict(os.environ)
+    # The child prints JSON with ensure_ascii=False; force UTF-8 so a Chinese
+    # Windows locale (cp936) cannot split a multi-byte title mid-character.
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    child_env.setdefault("PYTHONUTF8", "1")
     if args.print_url:
         proc = subprocess.run(
             [node, mjs, "--engine", args.engine, "--query", query, "--print-url", "1"],
-            capture_output=True, text=True, encoding="utf-8",
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, env=child_env,
         )
         print(proc.stdout.strip() or proc.stderr.strip())
         return
     cmd = [node, mjs, "--engine", args.engine, "--query", query, "--max", str(args.max), "--port", str(args.port)]
     if args.url:
         cmd += ["--url", args.url]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    # Hard timeout: a dead CDP socket would otherwise hang the CLI forever.
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=args.timeout, env=child_env)
+    except subprocess.TimeoutExpired:
+        sys.exit("browser-search timed out after " + str(args.timeout) + "s. "
+                 "Check that Chrome is responsive (run: literature.py doctor).")
     if proc.returncode != 0:
         sys.exit("browser-search failed: " + (proc.stderr.strip() or proc.stdout.strip()))
     try:
@@ -792,8 +880,15 @@ def cmd_browser_search(args):
         sys.exit("browser-search returned invalid JSON: " + proc.stdout[:500])
     if data.get("error"):
         print("browser-search:", data["error"])
-        print("Fallback: open the URL manually (or in the in-app browser), then save records per references/browser-patterns.md and re-run extract.")
-        return
+        if data.get("detail"):
+            print("  detail:", data["detail"])
+        if data.get("excerpt"):
+            print("  page text:", str(data["excerpt"])[:200].replace("\n", " "))
+        print("Fix: open the visible Chrome window, log in to this database once, then re-run.")
+        print("Note: zero results and a login wall are different outcomes; this run failed rather "
+              "than returning an empty list.")
+        print("Fallback: open the URL manually, then save records per references/browser-patterns.md.")
+        return 3
     records = []
     for it in data.get("results", []):
         author_raw = it.get("authors") or ""
@@ -834,12 +929,55 @@ def cmd_browser_search(args):
         print("Note: this platform usually requires login; finish login in the opened Chrome window and re-run.")
 
 
+CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+CYRILLIC_RE = re.compile(r"[\u0400-\u04ff][\u0400-\u04ff\-]{2,}")
+STOPWORDS_ZH = {"研究", "分析", "患者", "以及", "我们", "进行", "通过", "相关", "影响", "应用", "中的"}
+
+
+def topic_tokens(topic):
+    """Split a topic into matchable tokens for Latin, CJK and Cyrillic text.
+
+    English/Latin: words of 3+ characters. Chinese/Japanese: character bigrams
+    (there is no whitespace to split on, and bigrams are the standard cheap
+    approximation). Russian: words of 4+ characters. CJK bigrams that are pure
+    filler ("研究", "分析") are dropped so they do not inflate every score.
+    """
+    text = (topic or "").lower()
+    tokens = [t for t in re.findall(r"[a-z][a-z0-9\-]{2,}", text) if t not in STOPWORDS]
+    for run in CJK_RUN_RE.findall(text):
+        run = "".join(run.split())
+        if len(run) <= 2:
+            tokens.append(run)
+            continue
+        for i in range(len(run) - 1):
+            gram = run[i:i + 2]
+            if gram not in STOPWORDS_ZH:
+                tokens.append(gram)
+    tokens.extend(t for t in CYRILLIC_RE.findall(text) if t not in STOPWORDS)
+    seen = set()
+    ordered = []
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            ordered.append(token)
+    return ordered
+
+
 def topic_score(topic, text):
-    toks = [t for t in re.findall(r"[a-z]{3,}", (topic or "").lower()) if t not in STOPWORDS]
-    if not toks:
+    """Fraction of topic tokens present in the text; None when the topic is empty.
+
+    A literal match of the whole topic wins immediately, which matters for CJK
+    topics where bigram dilution would otherwise cap the score near 0.5.
+    """
+    tokens = topic_tokens(topic)
+    if not tokens:
         return None
     low = (text or "").lower()
-    return sum(1 for t in toks if t in low) / len(toks)
+    compact_topic = "".join((topic or "").lower().split())
+    compact_text = "".join(low.split())
+    if len(compact_topic) >= 4 and compact_topic in compact_text:
+        return 1.0
+    return sum(1 for token in tokens if token in low) / float(len(tokens))
 
 
 def topic_relevance(score):
@@ -850,6 +988,12 @@ def topic_relevance(score):
     if score >= 0.4:
         return "Medium"
     return "Low"
+
+
+def fmt_score(score):
+    """Format an optional score without crashing on None (the old bug)."""
+    return "n/a" if score is None else ("%.2f" % score)
+
 
 
 def cmd_extract(args):
@@ -881,9 +1025,9 @@ def cmd_extract(args):
         elif not abstract.strip():
             decision, reason = "uncertain", "no abstract available to screen"
         elif rel == "Low":
-            decision, reason = "exclude", f"low topic relevance (score {score:.2f})"
+            decision, reason = "exclude", f"low topic relevance (score {fmt_score(score)})"
         else:
-            decision, reason = "include", f"topic relevance {rel} (score {score:.2f}); evidence level {level}"
+            decision, reason = "include", f"topic relevance {rel} (score {fmt_score(score)}); evidence level {level}"
         fields = {
             "study design": design,
             "population": extract_population(full),
@@ -900,6 +1044,7 @@ def cmd_extract(args):
             "topic relevance": rel,
             "decision": decision,
             "reason": reason,
+            "evidence": auto_evidence_snippets(abstract),
         }
         row = [
             first_str(r.get("source_platform")) or "pubmed",
@@ -908,7 +1053,6 @@ def cmd_extract(args):
         ]
         for f in OVERVIEW_FIELDS:
             row.append(fields.get(f, ""))
-        row[OVERVIEW_FIELDS.index("evidence") + 7] = auto_evidence_snippets(abstract)
         rows.append(row)
     with open(args.out, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
@@ -921,39 +1065,33 @@ def cmd_extract(args):
 
 
 def write_xlsx(path, header, rows, widths=None):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
-    from openpyxl.utils import get_column_letter
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Literature Overview"
-    ws.append(header)
-    for row in rows:
-        ws.append(["" if v is None else v for v in row])
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="2F6DB3")
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    """Formatted XLSX via lit_common; degrades to a hint when openpyxl is absent."""
     if widths is None:
         widths = [10, 45, 22, 10, 20, 60] + [18] * len(OVERVIEW_FIELDS)
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = min(w, 45)
-    wb.save(path)
-    print(f"Excel written to {path}")
+    ok = lit_common.write_xlsx(path, header, rows, title="Literature Overview", widths=widths)
+    if ok:
+        print(f"Excel written to {path}")
+    return ok
 
 
 def openalex_by_dois(dois):
     """Fetch OpenAlex records (citation count, OA status, PDF) for a list of DOIs."""
-    dois = sorted({d.strip().lower() for d in dois if d and d.strip()})
+    normalized = {}
+    for raw in dois:
+        doi = lit_common.norm_doi(raw)
+        if doi:
+            normalized[doi] = raw
+    dois = sorted(normalized)
     out = {}
     for i in range(0, len(dois), 25):
         chunk = dois[i : i + 25]
-        params = {"filter": "doi:" + "|".join(chunk), "per-page": 25, "mailto": "research@example.com"}
-        url = OPENALEX + "?" + urllib.parse.urlencode(params)
+        params = {"filter": "doi:" + "|".join(chunk), "per-page": 25}
+        url = lit_common.with_mailto(OPENALEX + "?" + urllib.parse.urlencode(params))
         data = json.loads(http_get(url))
         for w in data.get("results", []):
-            doi = (w.get("doi") or "").lower().replace("https://doi.org/", "")
+            # Key the result by the same canonical DOI the caller searched with,
+            # so enrich() finds the record regardless of URL casing/prefix.
+            doi = lit_common.norm_doi(w.get("doi"))
             if doi:
                 out[doi] = w
         time.sleep(0.2)
@@ -1044,20 +1182,54 @@ def crossref_search(query, max_results, date_from, date_to, sort):
     sort_map = {"citations": "is-referenced-by-count", "date": "published", "relevance": "relevance"}
     params = {
         "query.bibliographic": query,
-        "rows": max_results,
+        # Ask for more rows than needed: peer-review artefacts are filtered out
+        # below, and without headroom a max=3 request would return 1 real paper.
+        "rows": max(int(max_results) * 2, 10),
         "sort": sort_map.get(sort, "relevance"),
-        "mailto": "research@example.com",
     }
     filters = []
+    # Without a type filter, Crossref's relevance ranking is dominated by
+    # peer-review reports ("Review for ..."), which are not citable literature.
+    filters.append("type:" + CROSSREF_DEFAULT_TYPE)
     if date_from:
         filters.append("from-pub-date:" + date_from.replace("/", "-"))
     if date_to:
         filters.append("until-pub-date:" + date_to.replace("/", "-"))
     if filters:
         params["filter"] = ",".join(filters)
-    url = CROSSREF + "?" + urllib.parse.urlencode(params)
+    url = lit_common.with_mailto(CROSSREF + "?" + urllib.parse.urlencode(params))
     data = json.loads(http_get_retry(url))
-    return [norm_crossref(m) for m in data.get("message", {}).get("items", [])]
+    records = []
+    for item in data.get("message", {}).get("items", []):
+        if not _is_citable_crossref(item):
+            continue
+        records.append(norm_crossref(item))
+        if len(records) >= max_results:
+            break
+    return records
+
+
+#: Crossref indexes peer-review reports and grant records as "works". They carry
+#: titles like 'Review for "..."' and are not citable literature.
+CROSSREF_DEFAULT_TYPE = os.environ.get("CROSSREF_TYPE", "journal-article")
+CROSSREF_CITABLE_TYPES = {
+    "journal-article", "proceedings-article", "posted-content", "book-chapter",
+    "book", "monograph", "report", "dissertation", "reference-entry", "dataset",
+}
+
+
+def _is_citable_crossref(item):
+    if item.get("type") == "peer-review":
+        return False
+    if re.search(r"/review\d+$", (item.get("DOI") or ""), re.I):
+        return False
+    title = first_str(item.get("title")).strip()
+    if title.lower().startswith("review for "):
+        return False
+    item_type = item.get("type")
+    if item_type and item_type not in CROSSREF_CITABLE_TYPES:
+        return False
+    return bool(title)
 
 
 def arxiv_search(query, max_results, date_from, date_to, sort):
@@ -1248,25 +1420,43 @@ def hal_search(query, max_results, date_from, date_to, sort):
 
 
 def cmd_enrich(args):
-    """Enrich PubMed records with OpenAlex citation counts, OA status, and PDF links."""
+    """Enrich records with OpenAlex citation counts, OA status, and PDF links.
+
+    Citation counts are stored per platform with a retrieval timestamp
+    (``citation_sources.openalex``) instead of being treated as a single truth:
+    OpenAlex, Crossref and Semantic Scholar disagree, so the number must stay
+    traceable to the registry and the moment it was read.
+    """
+    from datetime import datetime, timezone
     records = load_records(args.input)
     dois = [r.get("doi") for r in records]
     oa = openalex_by_dois(dois)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     n_hit = 0
     for r in records:
-        doi = (r.get("doi") or "").strip().lower()
-        w = oa.get(doi)
+        doi = lit_common.norm_doi(r.get("doi"))
+        w = oa.get(doi) if doi else None
         if not w:
             continue
         n_hit += 1
-        r["citation_count"] = w.get("cited_by_count")
+        count = w.get("cited_by_count")
+        r["citation_count"] = count
+        r.setdefault("citation_sources", {})["openalex"] = {
+            "count": count,
+            "retrieved_at": stamp,
+            "id": w.get("id", ""),
+        }
         r["oa_status"] = (w.get("open_access") or {}).get("oa_status")
         r["oa_pdf_url"] = ((w.get("best_oa_location") or {}).get("pdf_url") or "")
         r["openalex_title"] = w.get("title")
     save_records(records, args.out)
     print(f"Enriched {n_hit}/{len(records)} records via OpenAlex -> {args.out}")
+    print("Citation counts are stored under citation_sources.openalex with a retrieval time; "
+          "counts from different platforms are NOT summed.")
     for r in records:
-        print(f"  [{r['pmid']}] citations={r.get('citation_count', '-')} OA={r.get('oa_status', '-')} {(r.get('title') or '')[:70]}")
+        print(f"  [{first_str(r.get('pmid')) or first_str(r.get('doi')) or '-'}] "
+              f"citations={r.get('citation_count', '-')} OA={r.get('oa_status', '-')} "
+              f"{(r.get('title') or '')[:70]}")
 
 
 def cmd_search_multi(args):
@@ -1284,43 +1474,95 @@ def cmd_search_multi(args):
         sys.exit("Provide --query or --strategy-file.")
     if not sources:
         sys.exit("No sources given (use --sources pubmed,openalex,crossref).")
-    merged = {}
+    collected = []
+    errors = []
     for src in sources:
         queries = (strategy["queries"].get(src, []) if strategy else []) or [args.query]
         for q in queries:
-            if src == "pubmed":
-                recs = run_pubmed_search(q, args.max)
-                for r in recs:
-                    r["source_platform"] = "pubmed"
-            elif src == "openalex":
-                recs = openalex_search(q, args.max, date_from, date_to, args.sort)
-            elif src == "crossref":
-                recs = crossref_search(q, args.max, date_from, date_to, args.sort)
-            elif src == "arxiv":
-                recs = arxiv_search(q, args.max, date_from, date_to, args.sort)
-            elif src == "semanticscholar":
-                recs = semanticscholar_search(q, args.max, date_from, date_to, args.sort)
-            elif src == "europepmc":
-                recs = europepmc_search(q, args.max, date_from, date_to, args.sort)
-            elif src == "doaj":
-                recs = doaj_search(q, args.max, date_from, date_to, args.sort)
-            elif src == "hal":
-                recs = hal_search(q, args.max, date_from, date_to, args.sort)
-            else:
-                print(f"  unknown source {src!r}, skipped")
+            try:
+                if src == "pubmed":
+                    recs = run_pubmed_search(q, args.max)
+                    for r in recs:
+                        r["source_platform"] = "pubmed"
+                elif src == "openalex":
+                    recs = openalex_search(q, args.max, date_from, date_to, args.sort)
+                elif src == "crossref":
+                    recs = crossref_search(q, args.max, date_from, date_to, args.sort)
+                elif src == "arxiv":
+                    recs = arxiv_search(q, args.max, date_from, date_to, args.sort)
+                elif src == "semanticscholar":
+                    recs = semanticscholar_search(q, args.max, date_from, date_to, args.sort)
+                elif src == "europepmc":
+                    recs = europepmc_search(q, args.max, date_from, date_to, args.sort)
+                elif src == "doaj":
+                    recs = doaj_search(q, args.max, date_from, date_to, args.sort)
+                elif src == "hal":
+                    recs = hal_search(q, args.max, date_from, date_to, args.sort)
+                else:
+                    print(f"  unknown source {src!r}, skipped")
+                    continue
+            except Exception as exc:
+                # One unreachable or rate-limited platform must not abort the
+                # other seven; record why it was skipped and carry on.
+                errors.append(f"{src}: {exc}")
+                print(f"  {src}: FAILED ({type(exc).__name__}: {exc}) - continuing")
                 continue
             print(f"  {src}: {len(recs)} records")
             for r in recs:
                 r["query"] = q
-                key = (r.get("doi") or "").lower() or r.get("id") or r.get("pmid") or (r.get("title") or "").lower()
-                merged.setdefault(key, r)
-    records = list(merged.values())
+                r.setdefault("source_platform", src)
+                collected.append(r)
+    if errors:
+        print("  Sources unavailable this run: " + "; ".join(errors))
+    if not collected:
+        sys.exit("No source returned any record. Run 'literature.py doctor' to check network/API access.")
+    records, dedupe_report = lit_common.dedupe(collected)
     if args.sort == "citations":
         records.sort(key=lambda r: (r.get("citation_count") if isinstance(r.get("citation_count"), int) else -1), reverse=True)
     elif args.sort == "date":
         records.sort(key=lambda r: r.get("pubDate", ""), reverse=True)
     save_records(records, args.out)
-    print(f"Merged {len(sources)} sources -> {len(records)} unique records saved to {args.out}")
+    print(f"Merged {len(sources)} source(s): {dedupe_report['input']} records -> "
+          f"{len(records)} unique ({dedupe_report['merged_by_identifier']} merged by identifier, "
+          f"{dedupe_report['merged_by_title_pending_review']} merged by title for review)")
+    if dedupe_report["pending_review"]:
+        print("  Title-only merges to review: " + str(len(dedupe_report["pending_review"]))
+              + " (see dedupe --report for details)")
+    if dedupe_report["review_candidates"]:
+        print("  Same title + different identifiers (NOT merged): "
+              + str(len(dedupe_report["review_candidates"])))
+    print(f"Saved to {args.out}")
+
+
+
+def cmd_dedupe(args):
+    """Merge several record files and report exactly what was folded together."""
+    collected = []
+    for path in args.input:
+        records = load_records(path)
+        for record in records:
+            record.setdefault("source_platform", os.path.basename(path).rsplit(".", 1)[0])
+        collected.extend(records)
+        print(f"  {path}: {len(records)} records")
+    unique, report = lit_common.dedupe(collected)
+    save_records(unique, args.out)
+    print(f"Input {report['input']} -> unique {report['unique']} "
+          f"(merged by identifier: {report['merged_by_identifier']}, "
+          f"merged by title for review: {report['merged_by_title_pending_review']}, "
+          f"no identifier: {report['unkeyable']})")
+    if report["review_candidates"]:
+        print(f"! {len(report['review_candidates'])} pair(s) share a title but keep different identifiers; "
+              f"they were NOT merged. Review before citing.")
+        for item in report["review_candidates"][:10]:
+            print(f"    {item['key_a']}  <=>  {item['key_b']}: {item['title'][:70]}")
+    if report["merged_fields"]:
+        print("  Fields rescued from duplicates: "
+              + ", ".join(f"{k}+{v}" for k, v in sorted(report["merged_fields"].items())))
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"Dedupe report -> {args.report}")
+    print(f"Unique records -> {args.out}")
 
 
 def cmd_lite(args):
@@ -1429,10 +1671,14 @@ def cmd_screen(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Literature extraction/screening pipeline")
+    parser = argparse.ArgumentParser(
+        description="Literature pipeline: search, dedupe, verify, extract, screen, report",
+        epilog="Run '%(prog)s doctor' first if a source or the browser search misbehaves.",
+    )
+    parser.add_argument("--version", action="version", version="literature-analysis " + VERSION)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_fetch = sub.add_parser("fetch", help="Fetch PubMed records via pubmed-live and save as JSON")
+    p_fetch = sub.add_parser("fetch", help="Fetch PubMed records and save as JSON")
     p_fetch.add_argument("--query", required=True)
     p_fetch.add_argument("--max", type=int, default=10)
     p_fetch.add_argument("--out", required=True)
@@ -1535,6 +1781,8 @@ def main():
     p_bs.add_argument("--no-translate", action="store_true", help="disable auto-translation of the query to the engine's language")
     p_bs.add_argument("--out", default="browser_results.json")
     p_bs.add_argument("--xlsx", help="also write the results as a formatted Excel file")
+    p_bs.add_argument("--timeout", type=int, default=600,
+                      help="hard timeout in seconds for the browser run (default 600)")
     p_bs.set_defaults(func=cmd_browser_search)
 
     p_tq = sub.add_parser("translate-query", help="Translate a query for language-specific databases")
@@ -1549,16 +1797,31 @@ def main():
     p_screen.add_argument("--exclude", help="pipe-separated keywords, e.g. 'review|animal|editorial'")
     p_screen.set_defaults(func=cmd_screen)
 
+    p_dedupe = sub.add_parser("dedupe", help="Merge several record files and audit what was folded together")
+    p_dedupe.add_argument("--in", dest="input", action="append", required=True,
+                          help="records JSON file (repeat for each source)")
+    p_dedupe.add_argument("--out", required=True, help="merged, deduplicated records JSON")
+    p_dedupe.add_argument("--report", help="write the dedupe audit report as JSON")
+    p_dedupe.set_defaults(func=cmd_dedupe)
+
+    # New capability modules register themselves so this file stays readable.
+    lit_verify.add_parser(sub)
+    lit_prisma.add_parser(sub)
+    lit_doctor.add_parser(sub)
+
     args = parser.parse_args()
     try:
-        args.func(args)
+        return args.func(args) or 0
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     except json.JSONDecodeError as exc:
         print(f"Error parsing JSON: {exc}", file=sys.stderr)
         sys.exit(1)
+    except lit_common.HttpError as exc:
+        print(f"Network error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

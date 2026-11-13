@@ -1,0 +1,11 @@
+# Runtime dependencies
+# --------------------
+# The CLI uses the Python standard library only. Nothing is required to run
+# `literature.py` or `pubmed.py`.
+#
+# Optional: formatted --xlsx output. Without it the CSV is still written and the
+# command prints how to install it.
+#
+#   python -m pip install openpyxl
+#
+# openpyxl>=3.1

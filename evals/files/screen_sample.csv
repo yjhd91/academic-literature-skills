@@ -1,0 +1,4 @@
+pmid,doi,title,decision,reason,stage
+40181378,10.1186/s12967-024-06057-y,,include,retrospective with external validation,title_abstract
+39223336,10.1007/s00330-024-11036-4,,exclude,internal validation only,title_abstract
+,,肺结节放射组学模型的建立与外部验证,include,external validation cohort,title_abstract

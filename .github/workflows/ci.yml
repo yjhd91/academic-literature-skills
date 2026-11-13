@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install optional dependency (xlsx output)
+        run: python -m pip install --upgrade pip openpyxl
+
+      - name: Byte-compile the scripts
+        run: python -m compileall -q literature-analysis/scripts pubmed-live/scripts
+
+      - name: Offline unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate skill frontmatter and links
+        run: python tools/validate_skills.py --verbose
+
+      - name: CLI contract
+        run: |
+          python literature-analysis/scripts/literature.py --version
+          python literature-analysis/scripts/literature.py doctor --no-network
+
+  node:
+    name: Node module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax check
+        run: node --check literature-analysis/scripts/browser_search.mjs
+      - name: Engine list parses
+        run: node literature-analysis/scripts/browser_search.mjs --list 1
